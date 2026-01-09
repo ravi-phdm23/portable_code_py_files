@@ -1,0 +1,86 @@
+"""
+Database models for bulk execution tracking.
+
+These tables track bulk execution runs and per-dataset progress.
+They do not modify or interfere with existing database schema.
+"""
+
+from sqlalchemy import Column, Integer, String, Text, DateTime, Boolean
+from persistence.db import Base
+
+
+class BulkExecutionRun(Base):
+    """Master record for bulk execution session"""
+    __tablename__ = "bulk_execution_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_name = Column(String, nullable=False)  # User-provided name
+    created_at = Column(DateTime, nullable=False)
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+    status = Column(String, nullable=False)  # 'pending', 'running', 'completed', 'failed', 'cancelled'
+
+    # Execution parameters (JSON)
+    execution_config = Column(Text, nullable=False)  # {selected_model_groups, shap_params, etc}
+
+    # Summary statistics
+    total_datasets = Column(Integer, default=0)
+    completed_datasets = Column(Integer, default=0)
+    failed_datasets = Column(Integer, default=0)
+
+    # Error tracking
+    error_message = Column(Text)
+
+
+class BulkDatasetExecution(Base):
+    """Per-dataset execution tracking within bulk run"""
+    __tablename__ = "bulk_dataset_executions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bulk_run_id = Column(Integer, nullable=False, index=True)  # FK to BulkExecutionRun
+
+    filename = Column(String, nullable=False, index=True)
+    execution_order = Column(Integer, nullable=False)  # Sequence number (1, 2, 3...)
+
+    # Timestamps
+    started_at = Column(DateTime)
+    completed_at = Column(DateTime)
+
+    # Status tracking
+    status = Column(String, nullable=False)  # 'pending', 'running', 'completed', 'failed', 'skipped'
+    current_stage = Column(String)  # 'eda', 'feature_importance', 'smote', 'models', 'shap', 'statistical_tests', 'report'
+
+    # Stage completion flags
+    eda_completed = Column(Boolean, default=False)
+    feature_importance_completed = Column(Boolean, default=False)
+    smote_completed = Column(Boolean, default=False)
+    models_completed = Column(Boolean, default=False)
+    shap_completed = Column(Boolean, default=False)
+    statistical_tests_completed = Column(Boolean, default=False)
+    report_completed = Column(Boolean, default=False)
+
+    # Model execution progress
+    total_models = Column(Integer, default=0)
+    completed_models = Column(Integer, default=0)
+
+    # Artifact references
+    model_run_timestamp = Column(String)  # Links to ModelResult.timestamp
+    report_id = Column(Integer)  # FK to HistoricalReport
+
+    # Error tracking
+    error_stage = Column(String)  # Which stage failed
+    error_message = Column(Text)
+    error_traceback = Column(Text)
+
+
+class BulkProgressEvent(Base):
+    """Detailed progress events for debugging and audit trail"""
+    __tablename__ = "bulk_progress_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bulk_run_id = Column(Integer, nullable=False, index=True)
+    dataset_execution_id = Column(Integer, index=True)
+
+    timestamp = Column(DateTime, nullable=False)
+    event_type = Column(String, nullable=False)  # 'stage_started', 'stage_completed', 'model_completed', 'error', etc
+    event_data = Column(Text)  # JSON with event details

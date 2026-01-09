@@ -1,0 +1,266 @@
+"""
+Repository for analysis results storage and retrieval.
+Handles Pandas results, images, and feature importance results.
+"""
+
+import json
+import os
+import math
+import numpy as np
+from config import get_images_dir
+from persistence.db import PandasResult, ImageMetadata, FeatureImportanceResult, SMOTEResult, get_db_session
+
+
+def clean_data_for_json(obj):
+    """
+    Recursively clean data by converting NaN and infinity values to None.
+    This must be done BEFORE json.dumps() is called.
+    """
+    if isinstance(obj, float):
+        # Check for NaN and infinity
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: clean_data_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_data_for_json(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(clean_data_for_json(item) for item in obj)
+    elif isinstance(obj, np.ndarray):
+        return clean_data_for_json(obj.tolist())
+    elif isinstance(obj, (np.floating, np.integer)):
+        val = float(obj)
+        if math.isnan(val) or math.isinf(val):
+            return None
+        return val
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
+
+class NaNSafeEncoder(json.JSONEncoder):
+    """JSON encoder that handles NaN and infinity values"""
+    def encode(self, o):
+        """Clean the object before encoding"""
+        o = clean_data_for_json(o)
+        return super().encode(o)
+
+    def iterencode(self, o, _one_shot=False):
+        """Clean the object before iterencoding"""
+        o = clean_data_for_json(o)
+        return super().iterencode(o, _one_shot)
+
+
+def save_pandas_result(filename, result_type, result_data):
+    """
+    Save a Pandas analysis result.
+    result_data should be JSON-serializable.
+    Uses NaN-safe encoder to handle special float values.
+    """
+    db = get_db_session()
+    try:
+        result = PandasResult(
+            filename=filename,
+            result_type=result_type,
+            result_data=json.dumps(result_data, cls=NaNSafeEncoder)
+        )
+        db.add(result)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def load_pandas_result(filename, result_type):
+    """
+    Load a specific Pandas analysis result.
+    Returns parsed JSON or None if not found.
+    """
+    db = get_db_session()
+    try:
+        result = db.query(PandasResult).filter(
+            PandasResult.filename == filename,
+            PandasResult.result_type == result_type
+        ).first()
+
+        if result:
+            return json.loads(result.result_data)
+        return None
+
+    finally:
+        db.close()
+
+
+def save_image_path(filename, image_type, image_path):
+    """Save image metadata"""
+    db = get_db_session()
+    try:
+        image = ImageMetadata(
+            filename=filename,
+            image_type=image_type,
+            image_path=image_path
+        )
+        db.add(image)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def load_image_path(filename, image_type):
+    """
+    Load image path for a specific type.
+    Returns path string or None if not found.
+    """
+    db = get_db_session()
+    try:
+        image = db.query(ImageMetadata).filter(
+            ImageMetadata.filename == filename,
+            ImageMetadata.image_type == image_type
+        ).first()
+
+        return image.image_path if image else None
+
+    finally:
+        db.close()
+
+
+def save_feature_importance_result(filename, result_type, result_data):
+    """
+    Save feature importance calculation result.
+    result_type: "rf_table", "lr_table", "merged_table", "metadata"
+    Uses NaN-safe encoder to handle special float values.
+    """
+    db = get_db_session()
+    try:
+        result = FeatureImportanceResult(
+            filename=filename,
+            result_type=result_type,
+            result_data=json.dumps(result_data, cls=NaNSafeEncoder)
+        )
+        db.add(result)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def load_all_feature_importance_results(filename):
+    """
+    Load all feature importance results for a dataset.
+    Returns dict with result_type as keys.
+    """
+    db = get_db_session()
+    try:
+        results = db.query(FeatureImportanceResult).filter(
+            FeatureImportanceResult.filename == filename
+        ).all()
+
+        cached_results = {}
+        for result in results:
+            cached_results[result.result_type] = json.loads(result.result_data)
+
+        return cached_results
+
+    finally:
+        db.close()
+
+
+def check_feature_importance_cached(filename):
+    """
+    Check if all feature importance results are cached.
+    Returns True if all components exist.
+    """
+    db = get_db_session()
+    try:
+        cached_results = {}
+        results = db.query(FeatureImportanceResult).filter(
+            FeatureImportanceResult.filename == filename
+        ).all()
+
+        for result in results:
+            cached_results[result.result_type] = True
+
+        # Check for image
+        image = db.query(ImageMetadata).filter(
+            ImageMetadata.filename == filename,
+            ImageMetadata.image_type == "feature_importance"
+        ).first()
+
+        required_keys = ["rf_table", "lr_table", "merged_table", "metadata"]
+        return all(key in cached_results for key in required_keys) and image is not None
+
+    finally:
+        db.close()
+
+
+def delete_dataset_images(filename):
+    """
+    Delete all image files associated with a dataset.
+    Returns list of deleted files.
+    """
+    deleted_files = []
+    base_name = filename.replace('.csv', '')
+    underscore_name = base_name.replace(' ', '_')
+
+    for img_file in os.listdir(get_images_dir()):
+        if img_file.startswith(base_name) or img_file.startswith(underscore_name):
+            try:
+                os.remove(os.path.join(get_images_dir(), img_file))
+                deleted_files.append(img_file)
+            except Exception as e:
+                print(f"Warning: Failed to delete image file {img_file}: {str(e)}")
+
+    return deleted_files
+
+
+def save_smote_result(filename, result_data):
+    """
+    Save SMOTE analysis result.
+    Replaces existing SMOTE result for this filename.
+    Uses NaN-safe encoder to handle special float values.
+    """
+    db = get_db_session()
+    try:
+        # Delete existing SMOTE result for this filename
+        db.query(SMOTEResult).filter(SMOTEResult.filename == filename).delete()
+
+        # Save new result
+        result = SMOTEResult(
+            filename=filename,
+            result_data=json.dumps(result_data, cls=NaNSafeEncoder)
+        )
+        db.add(result)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def load_smote_result(filename):
+    """
+    Load SMOTE analysis result for a dataset.
+    Returns parsed JSON or None if not found.
+    """
+    db = get_db_session()
+    try:
+        result = db.query(SMOTEResult).filter(
+            SMOTEResult.filename == filename
+        ).first()
+
+        if result:
+            return json.loads(result.result_data)
+        return None
+
+    finally:
+        db.close()

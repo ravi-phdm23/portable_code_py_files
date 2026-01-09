@@ -1,0 +1,106 @@
+"""
+Progress Tracker
+
+Manages progress state and Server-Sent Events streaming for bulk execution.
+"""
+
+import json
+import asyncio
+from datetime import datetime
+from typing import Optional
+from bulk_execution.models import BulkExecutionRun, BulkDatasetExecution, BulkProgressEvent
+
+
+class ProgressTracker:
+    """
+    Manages progress state and Server-Sent Events streaming.
+    """
+
+    def __init__(self, db_session):
+        self.db = db_session
+
+    def record_event(
+        self,
+        bulk_run_id: int,
+        event_type: str,
+        event_data: dict,
+        dataset_execution_id: Optional[int] = None
+    ):
+        """Record progress event to database"""
+        event = BulkProgressEvent(
+            bulk_run_id=bulk_run_id,
+            dataset_execution_id=dataset_execution_id,
+            timestamp=datetime.now(),
+            event_type=event_type,
+            event_data=json.dumps(event_data)
+        )
+        self.db.add(event)
+        self.db.commit()
+
+    def get_run_status(self, bulk_run_id: int) -> dict:
+        """Get current status of bulk run"""
+        bulk_run = self.db.query(BulkExecutionRun).get(bulk_run_id)
+
+        if not bulk_run:
+            return None
+
+        # Get dataset executions
+        dataset_execs = self.db.query(BulkDatasetExecution).filter(
+            BulkDatasetExecution.bulk_run_id == bulk_run_id
+        ).order_by(BulkDatasetExecution.execution_order).all()
+
+        return {
+            'bulk_run': {
+                'id': bulk_run.id,
+                'run_name': bulk_run.run_name,
+                'status': bulk_run.status,
+                'total_datasets': bulk_run.total_datasets,
+                'completed_datasets': bulk_run.completed_datasets,
+                'failed_datasets': bulk_run.failed_datasets,
+                'started_at': bulk_run.started_at.isoformat() if bulk_run.started_at else None,
+                'completed_at': bulk_run.completed_at.isoformat() if bulk_run.completed_at else None
+            },
+            'datasets': [
+                {
+                    'id': de.id,
+                    'filename': de.filename,
+                    'execution_order': de.execution_order,
+                    'status': de.status,
+                    'current_stage': de.current_stage,
+                    'eda_completed': de.eda_completed,
+                    'feature_importance_completed': de.feature_importance_completed,
+                    'smote_completed': de.smote_completed,
+                    'models_completed': de.models_completed,
+                    'shap_completed': de.shap_completed,
+                    'report_completed': de.report_completed,
+                    'total_models': de.total_models,
+                    'completed_models': de.completed_models,
+                    'error_stage': de.error_stage,
+                    'error_message': de.error_message
+                }
+                for de in dataset_execs
+            ]
+        }
+
+    async def stream_progress(self, bulk_run_id: int):
+        """
+        SSE generator for real-time progress updates.
+        Yields formatted SSE events.
+        """
+        while True:
+            # Get current status
+            status = self.get_run_status(bulk_run_id)
+
+            if not status:
+                yield f"data: {json.dumps({'error': 'Run not found'})}\n\n"
+                break
+
+            # Send status update
+            yield f"data: {json.dumps(status)}\n\n"
+
+            # Check if run is complete
+            if status['bulk_run']['status'] in ['completed', 'failed', 'cancelled']:
+                break
+
+            # Wait before next update
+            await asyncio.sleep(1)  # Poll every 1 second

@@ -1,0 +1,249 @@
+"""
+Database models and session management.
+No business logic, only SQLAlchemy definitions.
+"""
+
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Float, text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from config import get_database_url
+
+# Global variables (initialized lazily)
+engine = None
+SessionLocal = None
+Base = declarative_base()
+
+
+class CSVMetadata(Base):
+    """Tracks uploaded CSV files by filename"""
+    __tablename__ = "csv_metadata"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, unique=True, nullable=False, index=True)
+    upload_timestamp = Column(DateTime, nullable=False)
+    total_rows = Column(Integer)
+    total_columns = Column(Integer)
+    target_column = Column(String, nullable=True)
+
+
+class CSVRow(Base):
+    """Generic storage for CSV rows. Each row is stored as JSON."""
+    __tablename__ = "csv_rows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    row_data = Column(Text, nullable=False)
+
+
+class PandasResult(Base):
+    """Stores Pandas processing results (e.g., df.describe())"""
+    __tablename__ = "pandas_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    result_type = Column(String, nullable=False)  # "describe", "column_summary", "target_distribution"
+    result_data = Column(Text, nullable=False)  # JSON string
+
+
+class DatasetQualitySummary(Base):
+    """
+    Stores Table X: Dataset Structure and Quality Summary
+    (research-grade, paper-ready)
+    """
+    __tablename__ = "dataset_quality_summary"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # provenance
+    filename = Column(String, nullable=False, index=True)
+    dataset_version = Column(String, nullable=True)
+
+    # fixed semantic identity
+    table_name = Column(String, nullable=False, default="Table X")
+    table_purpose = Column(
+        String,
+        nullable=False,
+        default="Dataset Structure and Quality Summary"
+    )
+
+    # serialized table rows (JSON)
+    table_data = Column(Text, nullable=False)
+
+
+class ImageMetadata(Base):
+    """Stores paths to generated images"""
+    __tablename__ = "image_metadata"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    image_type = Column(String, nullable=False)  # "pairplot", "correlation_heatmap", "feature_importance"
+    image_path = Column(String, nullable=False)
+
+
+class FeatureImportanceResult(Base):
+    """Stores feature importance calculation results"""
+    __tablename__ = "feature_importance_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    result_type = Column(String, nullable=False)  # "rf_table", "lr_table", "merged_table", "metadata"
+    result_data = Column(Text, nullable=False)  # JSON string
+
+
+class SMOTEResult(Base):
+    """Stores SMOTE analysis results"""
+    __tablename__ = "smote_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    result_data = Column(Text, nullable=False)  # JSON string with distributions and metadata
+
+
+class ModelResult(Base):
+    """Stores model execution results"""
+    __tablename__ = "model_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    model_name = Column(String, nullable=False)  # Full descriptive name like "Logistic Regression (L2, LBFGS)"
+    model_group = Column(String, nullable=True)
+    use_smote = Column(Integer, nullable=False)  # 0 or 1 (boolean)
+    selected_features = Column(Text, nullable=False)  # JSON list
+    metrics = Column(Text, nullable=False)  # JSON dict
+    timestamp = Column(DateTime, nullable=False)
+    execution_time = Column(Float, nullable=True)  # Execution time in seconds
+    execution_success = Column(Integer, nullable=True, default=1)  # 1 for success, 0 for failure
+    error_message = Column(Text, nullable=True)  # Error message if execution failed
+    model_path = Column(String, nullable=True)  # Path to pickled model file (e.g., "models/model.pkl")
+
+
+class GroupBestResult(Base):
+    """Stores the best model per group for a given run (derived summary)"""
+    __tablename__ = "group_best_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    run_timestamp = Column(DateTime, nullable=False, index=True)
+    model_group = Column(String, nullable=False)
+    model_name = Column(String, nullable=False)
+    metrics = Column(Text, nullable=False)  # JSON dict
+
+
+class BenchmarkResult(Base):
+    """Stores the single benchmark (best overall) model for a given run"""
+    __tablename__ = "benchmark_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    run_timestamp = Column(DateTime, nullable=False, index=True)
+    model_group = Column(String, nullable=False)
+    model_name = Column(String, nullable=False)
+    metrics = Column(Text, nullable=False)  # JSON dict
+    is_benchmark = Column(Integer, nullable=False, default=1)
+
+
+class SHAPResult(Base):
+    """Stores SHAP analysis results"""
+    __tablename__ = "shap_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    result_data = Column(Text, nullable=False)  # JSON string with full SHAP analysis
+    timestamp = Column(DateTime, nullable=False)
+
+
+class StatisticalTestResult(Base):
+    """Stores pairwise statistical significance test results"""
+    __tablename__ = "statistical_test_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    run_timestamp = Column(DateTime, nullable=False, index=True)
+    model_1_name = Column(String, nullable=False)
+    model_2_name = Column(String, nullable=False)
+    test_type = Column(String, nullable=False)  # "wilcoxon", "mcnemar", "delong"
+    statistic = Column(Float, nullable=True)  # Test statistic value
+    p_value = Column(Float, nullable=True)  # P-value
+    effect_size = Column(Float, nullable=True)  # Effect size (if applicable)
+    significant = Column(Integer, nullable=False)  # 1 if significant (p < 0.05), 0 otherwise
+    result_metadata = Column(Text, nullable=True)  # JSON with additional details (confidence intervals, etc.)
+    timestamp = Column(DateTime, nullable=False)
+
+
+class HistoricalReport(Base):
+    """Stores generated LaTeX/PDF reports"""
+    __tablename__ = "historical_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    report_type = Column(String, nullable=False)  # "individual" or "combined"
+    source_run_ids = Column(Text, nullable=False)  # JSON list of run identifiers
+    tex_path = Column(String, nullable=False)  # Path to .tex file
+    pdf_path = Column(String, nullable=True)  # Path to .pdf file (null if compilation failed)
+    timestamp = Column(DateTime, nullable=False)
+    report_metadata = Column(Text, nullable=True)  # JSON with filenames, run timestamps, etc.
+
+
+class LocalSHAPAnalysis(Base):
+    """Stores local (single-row) SHAP analysis results with AI explanations"""
+    __tablename__ = "local_shap_analyses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    filename = Column(String, nullable=False, index=True)
+    row_index = Column(Integer, nullable=False, index=True)
+    analysis_data = Column(Text, nullable=False)  # JSON with SHAP values, contributions, predictions
+    ai_explanation = Column(Text, nullable=True)  # JSON with AI-generated explanation
+    waterfall_plot_path = Column(String, nullable=True)  # Path to waterfall plot image
+    model_name = Column(String, nullable=True)  # Model used for analysis
+    run_timestamp = Column(String, nullable=True)  # Run timestamp for model selection
+    timestamp = Column(DateTime, nullable=False)  # When analysis was performed
+
+
+def get_engine():
+    """
+    Get or create database engine with configured path.
+    Implements lazy initialization pattern.
+    """
+    global engine, SessionLocal
+
+    if engine is None:
+        db_url = get_database_url()
+
+        engine = create_engine(
+            db_url,
+            connect_args={
+                "check_same_thread": False,
+                "timeout": 30  # 30 second timeout for locks
+            },
+            pool_pre_ping=True,  # Verify connections before using
+            pool_recycle=3600  # Recycle connections after 1 hour
+        )
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+        # Create all tables
+        Base.metadata.create_all(bind=engine)
+
+        # Enable WAL mode for better concurrency
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("PRAGMA journal_mode=WAL;"))
+                conn.commit()
+        except Exception as e:
+            print(f"Warning: Could not enable WAL mode: {e}")
+
+    return engine
+
+
+def get_db_session():
+    """Create a new database session"""
+    get_engine()  # Ensure engine exists
+    return SessionLocal()
+
+
+def get_db():
+    """Generator for FastAPI dependency injection"""
+    get_engine()  # Ensure engine exists
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

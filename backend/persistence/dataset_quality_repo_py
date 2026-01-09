@@ -1,0 +1,32 @@
+import json
+from persistence.db import DatasetQualitySummary
+
+
+def save_dataset_quality_summary(db, filename: str, table_rows: list[dict]):
+    """
+    Persist Table X.
+    Assumes previous entries for this filename are already deleted.
+    """
+    # Sort by Type (category) before saving to ensure consistent ordering in database
+    sorted_rows = sorted(table_rows, key=lambda x: x["Type"])
+    record = DatasetQualitySummary(
+        filename=filename,
+        table_data=json.dumps(sorted_rows)
+    )
+    db.add(record)
+
+
+def load_dataset_quality_summary(db, filename: str):
+    """
+    Load Table X from database.
+    Returns list of dicts (table rows) sorted by Type or None if not found.
+    """
+    record = db.query(DatasetQualitySummary).filter(
+        DatasetQualitySummary.filename == filename
+    ).first()
+
+    if record:
+        rows = json.loads(record.table_data)
+        # Ensure consistent ordering by Type (category) on retrieval
+        return sorted(rows, key=lambda x: x["Type"])
+    return None

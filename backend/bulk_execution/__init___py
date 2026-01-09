@@ -1,0 +1,8 @@
+"""
+Bulk Execution Module
+
+Self-contained orchestration layer for running the ML pipeline across multiple datasets.
+Does not modify existing code - purely invokes existing services and endpoints.
+"""
+
+__version__ = "1.0.0"

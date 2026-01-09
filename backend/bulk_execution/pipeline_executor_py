@@ -1,0 +1,703 @@
+"""
+Pipeline Executor
+
+Executes the complete ML pipeline for a single dataset.
+Invokes existing services without modifications.
+"""
+
+import traceback
+from typing import Dict, Any, Optional, Callable
+from datetime import datetime
+
+
+class PipelineExecutor:
+    """
+    Executes complete ML pipeline for single dataset.
+    Invokes existing services/endpoints without modifications.
+    """
+
+    PIPELINE_STAGES = [
+        'eda',                  # Stage 0: Exploratory Data Analysis
+        'feature_importance',   # Stage 1
+        'smote',                # Stage 2
+        'models',               # Stage 3
+        'shap',                 # Stage 4
+        'statistical_tests',    # Stage 5
+        'report'                # Stage 6
+    ]
+
+    def __init__(
+        self,
+        db_session,
+        filename: str,
+        execution_config: dict,
+        dataset_execution_id: int,
+        progress_callback: Optional[Callable] = None
+    ):
+        self.db = db_session
+        self.filename = filename
+        self.config = execution_config
+        self.dataset_exec_id = dataset_execution_id
+        self.progress_callback = progress_callback
+        self.current_stage = None
+        self.selected_features = None
+
+    async def execute_full_pipeline(self) -> dict:
+        """
+        Execute all pipeline stages sequentially.
+
+        Returns:
+            {
+                'model_run_timestamp': '2024-01-01T12:00:00',
+                'report_id': 123
+            }
+        """
+
+        result = {}
+
+        try:
+            # Stage 0: Exploratory Data Analysis (generates missing EDA artifacts)
+            await self._execute_eda()
+
+            # Stage 1: Feature Importance
+            await self._execute_feature_importance()
+
+            # Stage 2: SMOTE Analysis
+            await self._execute_smote()
+
+            # Stage 3: Model Execution
+            model_run_timestamp = await self._execute_models()
+            result['model_run_timestamp'] = model_run_timestamp
+
+            # Stage 4: SHAP Analysis
+            await self._execute_shap()
+
+            # Stage 5: Statistical Significance Tests
+            await self._execute_statistical_tests(model_run_timestamp)
+
+            # Stage 6: Report Generation
+            report_id = await self._execute_report(model_run_timestamp)
+            result['report_id'] = report_id
+
+        except Exception as e:
+            # Re-raise with context
+            raise Exception(f"Pipeline failed at stage '{self.current_stage}': {str(e)}")
+
+        return result
+
+    async def _execute_eda(self):
+        """Stage 0: Exploratory Data Analysis (idempotent - skips if cached)"""
+        self.current_stage = 'eda'
+        self._update_stage('eda', 'started')
+
+        from services.eda_service import (
+            generate_sample_data, generate_column_summary,
+            generate_describe_table, generate_target_distribution
+        )
+        from services.plotting_service import (
+            generate_pairplot, generate_correlation_heatmap
+        )
+        from persistence.analysis_repository import save_pandas_result, save_image_path, load_pandas_result
+        from persistence.dataset_repository import load_csv_data
+
+        # Load dataset
+        df = load_csv_data(self.filename)
+        if df is None:
+            raise Exception(f"Dataset not found: {self.filename}")
+
+        # Check if already exists (skip if cached)
+        cached_describe = load_pandas_result(self.filename, "describe")
+        if cached_describe:
+            # Already generated, skip
+            self._update_stage('eda', 'completed')
+            return
+
+        # Generate and save sample data
+        sample_data = generate_sample_data(df)
+        save_pandas_result(self.filename, "sample_data", sample_data)
+
+        # Generate and save column summary
+        column_summary = generate_column_summary(df)
+        save_pandas_result(self.filename, "column_summary", column_summary)
+
+        # Generate and save describe table
+        describe_table = generate_describe_table(df)
+        if describe_table:
+            save_pandas_result(self.filename, "describe", describe_table)
+
+        # Generate and save target distribution
+        target_dist = generate_target_distribution(df)
+        if target_dist:
+            save_pandas_result(self.filename, "target_distribution", target_dist)
+
+        # Generate and save pairplot
+        pairplot_path = generate_pairplot(df, self.filename)
+        if pairplot_path:
+            save_image_path(self.filename, "pairplot", pairplot_path)
+
+        # Generate and save correlation heatmap
+        heatmap_path = generate_correlation_heatmap(df, self.filename)
+        if heatmap_path:
+            save_image_path(self.filename, "correlation_heatmap", heatmap_path)
+
+        self._update_stage('eda', 'completed')
+
+    async def _execute_feature_importance(self):
+        """Stage 1: Calculate feature importance"""
+        self.current_stage = 'feature_importance'
+        self._update_stage('feature_importance', 'started')
+
+        from services.feature_importance_service import calculate_feature_importance
+        from persistence.dataset_repository import load_csv_data
+        from persistence.analysis_repository import save_feature_importance_result, save_image_path
+        from services.plotting_service import generate_feature_importance_chart
+
+        # Load dataset
+        df = load_csv_data(self.filename)
+        if df is None:
+            raise Exception(f"Dataset not found: {self.filename}")
+
+        # Calculate feature importance
+        fi_results = calculate_feature_importance(df)
+
+        # Save to database
+        save_feature_importance_result(self.filename, "rf_table", fi_results['rf_table'].to_dict(orient='records'))
+        save_feature_importance_result(self.filename, "lr_table", fi_results['lr_table'].to_dict(orient='records'))
+        save_feature_importance_result(self.filename, "merged_table", fi_results['merged_table'].to_dict(orient='records'))
+        save_feature_importance_result(self.filename, "metadata", {
+            "total_features": len(fi_results['feature_names']),
+            "feature_names": fi_results['feature_names']
+        })
+
+        # Generate chart
+        chart_path = generate_feature_importance_chart(fi_results['merged_table'], self.filename)
+        if chart_path:
+            save_image_path(self.filename, "feature_importance", chart_path)
+
+        # Store feature names for later stages
+        # Use base features (not transformed names) as run_models will handle transformation
+        self.selected_features = fi_results['merged_table']['base_feature'].tolist()
+
+        self._update_stage('feature_importance', 'completed')
+
+    async def _execute_smote(self):
+        """Stage 2: SMOTE analysis"""
+        self.current_stage = 'smote'
+        self._update_stage('smote', 'started')
+
+        from services.smote_service import apply_smote_analysis
+        from persistence.dataset_repository import load_csv_data
+        from persistence.analysis_repository import save_smote_result
+
+        # Load dataset
+        df = load_csv_data(self.filename)
+
+        # Apply SMOTE
+        use_smote = self.config.get('use_smote', False)
+        smote_result = apply_smote_analysis(df, self.selected_features, use_smote)
+
+        # Save to database
+        save_smote_result(self.filename, smote_result)
+
+        self._update_stage('smote', 'completed')
+
+    async def _execute_models(self) -> str:
+        """
+        Stage 3: Model execution
+        Returns: model_run_timestamp (ISO format string)
+        """
+        self.current_stage = 'models'
+        self._update_stage('models', 'started')
+
+        from services.model_service import run_models
+        from services.model_persistence import save_model  # NEW: Import model persistence
+        from persistence.dataset_repository import load_csv_data
+        from persistence.model_repository import (
+            save_model_result, save_group_best_result, save_benchmark_result,
+            delete_model_results
+        )
+        from persistence.shap_repository import delete_shap_result
+        from bulk_execution.models import BulkDatasetExecution
+
+        # Load dataset
+        df = load_csv_data(self.filename)
+
+        # Prepare progress callback for model execution
+        def model_progress_callback(event_type: str, **kwargs):
+            if event_type == 'model_started':
+                self._emit_progress('model_started', {
+                    'group': kwargs.get('group'),
+                    'model': kwargs.get('model'),
+                    'total': kwargs.get('total'),
+                    'completed': kwargs.get('completed')
+                })
+            elif event_type == 'model_completed':
+                # Update dataset execution
+                dataset_exec = self.db.query(BulkDatasetExecution).get(self.dataset_exec_id)
+                dataset_exec.completed_models = kwargs.get('completed', 0)
+                self.db.commit()
+
+                self._emit_progress('model_completed', {
+                    'group': kwargs.get('group'),
+                    'model': kwargs.get('model'),
+                    'total': kwargs.get('total'),
+                    'completed': kwargs.get('completed')
+                })
+
+        # Execute models
+        use_smote = self.config.get('use_smote', False)
+        selected_model_groups = self.config.get('selected_model_groups', [])
+
+        # Convert list of group names to dictionary format expected by run_models
+        # If it's already a dict, use as-is. If it's a list, convert to {group: None}
+        # which tells run_models to use all variants for each group
+        if isinstance(selected_model_groups, list):
+            selected_model_groups = {group: None for group in selected_model_groups}
+
+        result = run_models(
+            df=df,
+            selected_features=self.selected_features,
+            target_column='target',
+            use_smote=use_smote,
+            selected_model_groups=selected_model_groups,
+            progress_callback=model_progress_callback
+        )
+
+        # Store total models count
+        dataset_exec = self.db.query(BulkDatasetExecution).get(self.dataset_exec_id)
+        dataset_exec.total_models = len(result.get('all_models', []))
+        self.db.commit()
+
+        # Delete old results
+        delete_model_results(self.filename)
+        delete_shap_result(self.filename)
+
+        # Create run timestamp
+        run_timestamp = datetime.now()
+        run_timestamp_str = run_timestamp.isoformat()
+
+        # Save model results
+        for model_result in result.get('all_models', []):
+            # NEW: Save trained model to disk
+            model_path = None
+            trained_model = model_result.get('trained_model')
+            if trained_model is not None and model_result.get('execution_success'):
+                try:
+                    model_path = save_model(
+                        model=trained_model,
+                        filename=self.filename,
+                        model_name=model_result.get('model_name'),
+                        timestamp=run_timestamp
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to save model {model_result.get('model_name')}: {e}")
+
+            save_model_result(
+                filename=self.filename,
+                model_name=model_result.get('model_name'),
+                model_group=model_result.get('model_group'),
+                use_smote=use_smote,
+                selected_features={
+                    'base': self.selected_features,
+                    'transformed': result.get('selected_features_transformed', [])
+                },
+                metrics=model_result.get('metrics'),
+                timestamp=run_timestamp,
+                execution_time=model_result.get('execution_time'),
+                execution_success=model_result.get('execution_success', True),
+                error_message=model_result.get('error_message'),
+                model_path=model_path  # NEW: Pass model path to database
+            )
+
+        # Save group bests
+        for group_name, info in result.get('best_models_by_group', {}).items():
+            save_group_best_result(
+                filename=self.filename,
+                run_timestamp=run_timestamp,
+                model_group=group_name,
+                model_name=info.get('model_name'),
+                metrics=info.get('metrics')
+            )
+
+        # Save benchmark
+        if result.get('benchmark_model'):
+            bm = result['benchmark_model']
+            save_benchmark_result(
+                filename=self.filename,
+                run_timestamp=run_timestamp,
+                model_group=bm.get('model_group'),
+                model_name=bm.get('model_name'),
+                metrics=bm.get('metrics')
+            )
+
+        self._update_stage('models', 'completed')
+        return run_timestamp_str
+
+    async def _execute_shap(self):
+        """Stage 4: SHAP analysis"""
+        self.current_stage = 'shap'
+        self._update_stage('shap', 'started')
+
+        from services.shap_service import run_shap_analysis
+        from persistence.dataset_repository import load_csv_data
+        from persistence.shap_repository import save_shap_result
+        from persistence.analysis_repository import save_image_path
+
+        # Load dataset
+        df = load_csv_data(self.filename)
+
+        # Get SHAP parameters
+        shap_params = self.config.get('shap_params', {})
+        n_trials = shap_params.get('n_trials', 5)
+        bg_size = shap_params.get('bg_size', 50)
+        use_smote = self.config.get('use_smote', False)
+
+        # Run SHAP analysis
+        shap_result = run_shap_analysis(
+            df=df,
+            selected_features=self.selected_features,
+            filename=self.filename,
+            target_column='target',
+            n_trials=n_trials,
+            bg_size=bg_size,
+            use_smote=use_smote
+        )
+
+        # Save to database
+        save_shap_result(self.filename, shap_result)
+
+        # Save image paths
+        if shap_result.get('plots'):
+            if shap_result['plots'].get('summary_plot'):
+                save_image_path(self.filename, 'shap_summary', shap_result['plots']['summary_plot'])
+            if shap_result['plots'].get('bar_plot'):
+                save_image_path(self.filename, 'shap_bar', shap_result['plots']['bar_plot'])
+
+        self._update_stage('shap', 'completed')
+
+    async def _execute_statistical_tests(self, model_run_timestamp: str):
+        """Stage 5: Statistical Significance Tests"""
+        self.current_stage = 'statistical_tests'
+        self._update_stage('statistical_tests', 'started')
+
+        # Check if statistical tests are enabled in config
+        statistical_tests_config = self.config.get('statistical_tests', {})
+        if not statistical_tests_config.get('enabled', True):
+            print(f"Statistical tests disabled for {self.filename}, skipping...")
+            self._update_stage('statistical_tests', 'skipped')
+            return
+
+        from services.statistical_tests_service import (
+            wilcoxon_signed_rank_test,
+            mcnemar_test,
+            delong_test,
+            save_statistical_test_result
+        )
+        from persistence.dataset_repository import load_csv_data
+        from persistence.model_repository import load_model_results
+        from services.model_persistence import load_model_by_name
+        from sklearn.model_selection import StratifiedKFold
+        from sklearn.metrics import roc_auc_score
+        from sklearn.preprocessing import LabelEncoder
+        import numpy as np
+
+        # Get test configuration
+        test_types = statistical_tests_config.get('test_types', ['wilcoxon', 'mcnemar', 'delong'])
+        comparison_strategy = statistical_tests_config.get('comparison_strategy', 'best_per_group')
+
+        # Load dataset
+        df = load_csv_data(self.filename)
+        if df is None:
+            raise Exception(f"Dataset {self.filename} not found")
+
+        # Load all model results for this run
+        all_results = load_model_results(self.filename)
+        run_results = [r for r in all_results if r['timestamp'] == model_run_timestamp]
+
+        if not run_results:
+            print(f"No model results found for {self.filename} at {model_run_timestamp}")
+            self._update_stage('statistical_tests', 'skipped')
+            return
+
+        # Determine model pairs to compare based on strategy
+        model_pairs = []
+
+        if comparison_strategy == 'best_per_group':
+            # Compare best model from each group
+            from persistence.model_repository import load_group_bests
+            group_bests = load_group_bests(self.filename, model_run_timestamp)
+
+            if len(group_bests) >= 2:
+                best_models = sorted(group_bests, key=lambda x: x.get('metrics', {}).get('test_auc', 0), reverse=True)
+                # Compare top 2 models
+                if len(best_models) >= 2:
+                    model_pairs.append({
+                        'model_1_name': best_models[0]['model_name'],
+                        'model_2_name': best_models[1]['model_name']
+                    })
+
+        elif comparison_strategy == 'all_pairs':
+            # Compare all possible pairs (can be expensive)
+            successful_models = [r for r in run_results if r.get('execution_success', True)]
+            for i in range(len(successful_models)):
+                for j in range(i + 1, len(successful_models)):
+                    model_pairs.append({
+                        'model_1_name': successful_models[i]['model_name'],
+                        'model_2_name': successful_models[j]['model_name']
+                    })
+
+        elif comparison_strategy == 'benchmark_vs_all':
+            # Compare benchmark against all other models
+            from persistence.model_repository import load_benchmark_for_run
+            benchmark = load_benchmark_for_run(self.filename, model_run_timestamp)
+
+            if benchmark:
+                for result in run_results:
+                    if result['model_name'] != benchmark['model_name']:
+                        model_pairs.append({
+                            'model_1_name': benchmark['model_name'],
+                            'model_2_name': result['model_name']
+                        })
+
+        if not model_pairs:
+            print(f"No model pairs to compare for {self.filename}")
+            self._update_stage('statistical_tests', 'skipped')
+            return
+
+        # Prepare data
+        X = df[self.selected_features].copy()
+        y = df['target'].copy()
+
+        # Handle categorical encoding
+        for col in X.select_dtypes(include=['object', 'category']).columns:
+            le = LabelEncoder()
+            X[col] = le.fit_transform(X[col].astype(str))
+
+        # Encode target if categorical
+        if y.dtype == 'object' or y.dtype.name == 'category':
+            le_target = LabelEncoder()
+            y = le_target.fit_transform(y.astype(str))
+
+        # Apply SMOTE if configured
+        use_smote = self.config.get('use_smote', False)
+        if use_smote:
+            from imblearn.over_sampling import SMOTE
+            try:
+                smote = SMOTE(random_state=42)
+                X, y = smote.fit_resample(X, y)
+            except Exception as e:
+                print(f"Warning: SMOTE failed: {e}. Continuing without SMOTE.")
+
+        # Run tests for each pair
+        total_tests = len(model_pairs) * len(test_types)
+        completed_tests = 0
+
+        for pair in model_pairs:
+            model_1_name = pair['model_1_name']
+            model_2_name = pair['model_2_name']
+
+            try:
+                # Load models
+                from datetime import datetime as dt
+                run_ts = dt.fromisoformat(model_run_timestamp)
+
+                model_1 = load_model_by_name(self.filename, model_1_name, run_ts)
+                model_2 = load_model_by_name(self.filename, model_2_name, run_ts)
+
+                if model_1 is None or model_2 is None:
+                    print(f"Could not load models: {model_1_name}, {model_2_name}")
+                    continue
+
+                # Wilcoxon test (requires CV)
+                if 'wilcoxon' in test_types:
+                    try:
+                        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+                        auc_scores_1 = []
+                        auc_scores_2 = []
+
+                        for train_idx, test_idx in cv.split(X, y):
+                            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+                            y_train, y_test = y[train_idx], y[test_idx]
+
+                            # Clone and train models
+                            from sklearn.base import clone
+                            m1_fold = clone(model_1)
+                            m2_fold = clone(model_2)
+
+                            m1_fold.fit(X_train, y_train)
+                            m2_fold.fit(X_train, y_train)
+
+                            # Get scores
+                            if hasattr(m1_fold, 'predict_proba'):
+                                y_score_1 = m1_fold.predict_proba(X_test)[:, 1]
+                                y_score_2 = m2_fold.predict_proba(X_test)[:, 1]
+                            else:
+                                y_score_1 = m1_fold.decision_function(X_test)
+                                y_score_2 = m2_fold.decision_function(X_test)
+
+                            auc_1 = roc_auc_score(y_test, y_score_1)
+                            auc_2 = roc_auc_score(y_test, y_score_2)
+
+                            auc_scores_1.append(auc_1)
+                            auc_scores_2.append(auc_2)
+
+                        wilcoxon_result = wilcoxon_signed_rank_test(
+                            np.array(auc_scores_1),
+                            np.array(auc_scores_2),
+                            metric_name="AUC"
+                        )
+
+                        save_statistical_test_result(
+                            filename=self.filename,
+                            run_timestamp=run_ts,
+                            model_1_name=model_1_name,
+                            model_2_name=model_2_name,
+                            test_result=wilcoxon_result
+                        )
+
+                        completed_tests += 1
+
+                    except Exception as e:
+                        print(f"Wilcoxon test failed for {model_1_name} vs {model_2_name}: {e}")
+
+                # McNemar and DeLong tests (use full dataset)
+                y_pred_1 = model_1.predict(X)
+                y_pred_2 = model_2.predict(X)
+
+                if hasattr(model_1, 'predict_proba'):
+                    y_score_1 = model_1.predict_proba(X)[:, 1]
+                    y_score_2 = model_2.predict_proba(X)[:, 1]
+                else:
+                    y_score_1 = model_1.decision_function(X)
+                    y_score_2 = model_2.decision_function(X)
+
+                # McNemar test
+                if 'mcnemar' in test_types:
+                    try:
+                        mcnemar_result = mcnemar_test(
+                            y_true=y,
+                            y_pred_1=y_pred_1,
+                            y_pred_2=y_pred_2
+                        )
+
+                        save_statistical_test_result(
+                            filename=self.filename,
+                            run_timestamp=run_ts,
+                            model_1_name=model_1_name,
+                            model_2_name=model_2_name,
+                            test_result=mcnemar_result
+                        )
+
+                        completed_tests += 1
+
+                    except Exception as e:
+                        print(f"McNemar test failed for {model_1_name} vs {model_2_name}: {e}")
+
+                # DeLong test
+                if 'delong' in test_types:
+                    try:
+                        delong_result = delong_test(
+                            y_true=y,
+                            y_score_1=y_score_1,
+                            y_score_2=y_score_2
+                        )
+
+                        save_statistical_test_result(
+                            filename=self.filename,
+                            run_timestamp=run_ts,
+                            model_1_name=model_1_name,
+                            model_2_name=model_2_name,
+                            test_result=delong_result
+                        )
+
+                        completed_tests += 1
+
+                    except Exception as e:
+                        print(f"DeLong test failed for {model_1_name} vs {model_2_name}: {e}")
+
+            except Exception as e:
+                print(f"Error comparing {model_1_name} vs {model_2_name}: {e}")
+                import traceback
+                traceback.print_exc()
+
+        print(f"Completed {completed_tests}/{total_tests} statistical tests for {self.filename}")
+        self._update_stage('statistical_tests', 'completed')
+
+    async def _execute_report(self, model_run_timestamp: str) -> int:
+        """
+        Stage 6: Report generation
+        Returns: report_id
+        """
+        self.current_stage = 'report'
+        self._update_stage('report', 'started')
+
+        from services.report_artifacts_collector import collect_all_artifacts
+        from services.latex_service import generate_comprehensive_latex_report, compile_latex_to_pdf
+        from persistence.report_repository import save_report
+        from config import get_reports_dir
+        from persistence.db import get_db
+
+        # Collect artifacts
+        artifacts = collect_all_artifacts(self.filename, model_run_timestamp)
+
+        if not artifacts.get('run_data'):
+            raise Exception("No model run data found for report generation")
+
+        # Generate LaTeX
+        latex_content = generate_comprehensive_latex_report(**artifacts)
+
+        # Compile to PDF
+        output_dir = get_reports_dir()
+        output_name = f"bulk_report_{self.filename}_{model_run_timestamp}".replace(":", "-").replace(" ", "_")
+        compilation_result = compile_latex_to_pdf(latex_content, output_dir, output_name)
+
+        # Save to database
+        db = next(get_db())
+        try:
+            report = save_report(
+                db=db,
+                report_type="bulk_individual",
+                source_run_ids=[f"{self.filename}|{model_run_timestamp}"],
+                tex_path=compilation_result['tex_path'],
+                pdf_path=compilation_result.get('pdf_path'),
+                metadata={
+                    'filename': self.filename,
+                    'timestamp': model_run_timestamp,
+                    'bulk_execution': True,
+                    'compilation_success': compilation_result['success'],
+                    'error_type': compilation_result.get('error_type'),
+                    'error_summary': compilation_result.get('error_summary')
+                }
+            )
+            report_id = report.id
+        finally:
+            db.close()
+
+        self._update_stage('report', 'completed')
+        return report_id
+
+    def _update_stage(self, stage: str, status: str):
+        """Update dataset execution record with stage progress"""
+        from bulk_execution.models import BulkDatasetExecution
+
+        dataset_exec = self.db.query(BulkDatasetExecution).get(self.dataset_exec_id)
+
+        if status == 'started':
+            dataset_exec.current_stage = stage
+        elif status == 'completed':
+            # Set completion flag
+            setattr(dataset_exec, f"{stage}_completed", True)
+
+        self.db.commit()
+
+        # Emit progress event
+        self._emit_progress(f'stage_{status}', {'stage': stage})
+
+    def _emit_progress(self, event_type: str, event_data: dict):
+        """Emit progress event via callback"""
+        if self.progress_callback:
+            self.progress_callback(event_type, {
+                'filename': self.filename,
+                'dataset_execution_id': self.dataset_exec_id,
+                **event_data
+            })

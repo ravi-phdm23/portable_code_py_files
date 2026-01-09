@@ -1,0 +1,189 @@
+"""
+Bulk Execution Orchestrator
+
+Coordinates bulk execution across multiple datasets.
+Delegates actual pipeline execution to PipelineExecutor.
+"""
+
+import json
+import traceback
+from datetime import datetime
+from typing import List, Optional, Callable
+from bulk_execution.models import BulkExecutionRun, BulkDatasetExecution
+from bulk_execution.pipeline_executor import PipelineExecutor
+from bulk_execution.progress_tracker import ProgressTracker
+
+
+class BulkExecutionOrchestrator:
+    """
+    Main orchestrator for bulk execution.
+    Manages lifecycle of bulk run and delegates to PipelineExecutor.
+    """
+
+    def __init__(self, db_session):
+        self.db = db_session
+        self.progress_tracker = ProgressTracker(db_session)
+
+    async def execute_bulk_run(
+        self,
+        run_name: str,
+        dataset_filenames: List[str],
+        execution_config: dict,
+        progress_callback: Optional[Callable] = None
+    ) -> int:
+        """
+        Execute pipeline on multiple datasets.
+
+        Args:
+            run_name: User-provided name for this bulk run
+            dataset_filenames: List of datasets to process
+            execution_config: {
+                'selected_model_groups': ['Logistic Regression', 'AdaBoost', ...],
+                'use_smote': True/False,
+                'shap_params': {'n_trials': 5, 'bg_size': 50}
+            }
+            progress_callback: Optional function for SSE progress
+
+        Returns:
+            bulk_run_id: ID of created BulkExecutionRun
+        """
+
+        # 1. Create bulk run record
+        bulk_run = BulkExecutionRun(
+            run_name=run_name,
+            created_at=datetime.now(),
+            status='pending',
+            execution_config=json.dumps(execution_config),
+            total_datasets=len(dataset_filenames)
+        )
+        self.db.add(bulk_run)
+        self.db.commit()
+
+        # 2. Create dataset execution records
+        for idx, filename in enumerate(dataset_filenames, start=1):
+            dataset_exec = BulkDatasetExecution(
+                bulk_run_id=bulk_run.id,
+                filename=filename,
+                execution_order=idx,
+                status='pending'
+            )
+            self.db.add(dataset_exec)
+        self.db.commit()
+
+        # 3. Start execution
+        bulk_run.status = 'running'
+        bulk_run.started_at = datetime.now()
+        self.db.commit()
+
+        try:
+            # 4. Execute each dataset sequentially
+            for dataset_exec in self._get_pending_datasets(bulk_run.id):
+                await self._execute_single_dataset(
+                    bulk_run_id=bulk_run.id,
+                    dataset_exec=dataset_exec,
+                    execution_config=execution_config,
+                    progress_callback=progress_callback
+                )
+
+            # 5. Mark as completed
+            bulk_run.status = 'completed'
+            bulk_run.completed_at = datetime.now()
+            self.db.commit()
+
+        except Exception as e:
+            # Handle catastrophic failure
+            bulk_run.status = 'failed'
+            bulk_run.error_message = str(e)
+            bulk_run.completed_at = datetime.now()
+            self.db.commit()
+            raise
+
+        return bulk_run.id
+
+    async def _execute_single_dataset(
+        self,
+        bulk_run_id: int,
+        dataset_exec: BulkDatasetExecution,
+        execution_config: dict,
+        progress_callback: Optional[Callable]
+    ):
+        """Execute pipeline for single dataset within bulk run"""
+
+        # Update status
+        dataset_exec.status = 'running'
+        dataset_exec.started_at = datetime.now()
+        self.db.commit()
+
+        # Emit progress event
+        if progress_callback:
+            progress_callback('dataset_started', {
+                'bulk_run_id': bulk_run_id,
+                'filename': dataset_exec.filename,
+                'execution_order': dataset_exec.execution_order
+            })
+
+        try:
+            # Delegate to pipeline executor
+            pipeline = PipelineExecutor(
+                db_session=self.db,
+                filename=dataset_exec.filename,
+                execution_config=execution_config,
+                dataset_execution_id=dataset_exec.id,
+                progress_callback=progress_callback
+            )
+
+            result = await pipeline.execute_full_pipeline()
+
+            # Update dataset execution with results
+            dataset_exec.status = 'completed'
+            dataset_exec.completed_at = datetime.now()
+            dataset_exec.model_run_timestamp = result['model_run_timestamp']
+            dataset_exec.report_id = result.get('report_id')
+            self.db.commit()
+
+            # Update bulk run statistics
+            bulk_run = self.db.query(BulkExecutionRun).get(bulk_run_id)
+            bulk_run.completed_datasets += 1
+            self.db.commit()
+
+            # Emit completion event
+            if progress_callback:
+                progress_callback('dataset_completed', {
+                    'bulk_run_id': bulk_run_id,
+                    'filename': dataset_exec.filename,
+                    'status': 'success'
+                })
+
+        except Exception as e:
+            # Handle dataset-level failure (continue to next dataset)
+            dataset_exec.status = 'failed'
+            dataset_exec.error_stage = pipeline.current_stage if hasattr(pipeline, 'current_stage') else 'unknown'
+            dataset_exec.error_message = str(e)
+            dataset_exec.error_traceback = traceback.format_exc()
+            dataset_exec.completed_at = datetime.now()
+            self.db.commit()
+
+            # Update bulk run statistics
+            bulk_run = self.db.query(BulkExecutionRun).get(bulk_run_id)
+            bulk_run.failed_datasets += 1
+            self.db.commit()
+
+            # Emit error event
+            if progress_callback:
+                progress_callback('dataset_failed', {
+                    'bulk_run_id': bulk_run_id,
+                    'filename': dataset_exec.filename,
+                    'error': str(e),
+                    'stage': dataset_exec.error_stage
+                })
+
+            # Log error but continue to next dataset
+            import logging
+            logging.error(f"Bulk execution failed for {dataset_exec.filename}: {e}")
+
+    def _get_pending_datasets(self, bulk_run_id: int):
+        """Get all pending datasets for bulk run"""
+        return self.db.query(BulkDatasetExecution).filter(
+            BulkDatasetExecution.bulk_run_id == bulk_run_id,
+            BulkDatasetExecution.status == 'pending'
+        ).order_by(BulkDatasetExecution.execution_order).all()

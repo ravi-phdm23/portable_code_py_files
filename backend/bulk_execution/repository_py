@@ -1,0 +1,154 @@
+"""
+Repository Functions
+
+Database access functions for bulk execution records.
+"""
+
+from typing import List, Dict, Any, Optional
+from persistence.db import get_db_session
+from bulk_execution.models import BulkExecutionRun, BulkDatasetExecution, BulkProgressEvent
+
+
+def get_all_bulk_runs() -> List[Dict[str, Any]]:
+    """List all bulk execution runs"""
+    db = get_db_session()
+    try:
+        runs = db.query(BulkExecutionRun).order_by(BulkExecutionRun.created_at.desc()).all()
+
+        return [
+            {
+                'id': run.id,
+                'run_name': run.run_name,
+                'status': run.status,
+                'total_datasets': run.total_datasets,
+                'completed_datasets': run.completed_datasets,
+                'failed_datasets': run.failed_datasets,
+                'created_at': run.created_at.isoformat(),
+                'started_at': run.started_at.isoformat() if run.started_at else None,
+                'completed_at': run.completed_at.isoformat() if run.completed_at else None
+            }
+            for run in runs
+        ]
+    finally:
+        db.close()
+
+
+def get_bulk_run_details(bulk_run_id: int) -> Optional[Dict[str, Any]]:
+    """Get detailed results of bulk run including all dataset executions"""
+    db = get_db_session()
+    try:
+        bulk_run = db.query(BulkExecutionRun).get(bulk_run_id)
+        if not bulk_run:
+            return None
+
+        # Get dataset executions
+        dataset_execs = db.query(BulkDatasetExecution).filter(
+            BulkDatasetExecution.bulk_run_id == bulk_run_id
+        ).order_by(BulkDatasetExecution.execution_order).all()
+
+        return {
+            'bulk_run': {
+                'id': bulk_run.id,
+                'run_name': bulk_run.run_name,
+                'status': bulk_run.status,
+                'execution_config': bulk_run.execution_config,
+                'total_datasets': bulk_run.total_datasets,
+                'completed_datasets': bulk_run.completed_datasets,
+                'failed_datasets': bulk_run.failed_datasets,
+                'created_at': bulk_run.created_at.isoformat(),
+                'started_at': bulk_run.started_at.isoformat() if bulk_run.started_at else None,
+                'completed_at': bulk_run.completed_at.isoformat() if bulk_run.completed_at else None,
+                'error_message': bulk_run.error_message
+            },
+            'datasets': [
+                {
+                    'id': de.id,
+                    'filename': de.filename,
+                    'execution_order': de.execution_order,
+                    'status': de.status,
+                    'current_stage': de.current_stage,
+                    'eda_completed': de.eda_completed,
+                    'feature_importance_completed': de.feature_importance_completed,
+                    'smote_completed': de.smote_completed,
+                    'models_completed': de.models_completed,
+                    'shap_completed': de.shap_completed,
+                    'report_completed': de.report_completed,
+                    'total_models': de.total_models,
+                    'completed_models': de.completed_models,
+                    'model_run_timestamp': de.model_run_timestamp,
+                    'report_id': de.report_id,
+                    'started_at': de.started_at.isoformat() if de.started_at else None,
+                    'completed_at': de.completed_at.isoformat() if de.completed_at else None,
+                    'error_stage': de.error_stage,
+                    'error_message': de.error_message
+                }
+                for de in dataset_execs
+            ]
+        }
+    finally:
+        db.close()
+
+
+def delete_bulk_run(bulk_run_id: int) -> bool:
+    """Delete bulk run and all associated dataset executions and events"""
+    db = get_db_session()
+    try:
+        bulk_run = db.query(BulkExecutionRun).get(bulk_run_id)
+        if not bulk_run:
+            return False
+
+        # Delete associated dataset executions
+        db.query(BulkDatasetExecution).filter(
+            BulkDatasetExecution.bulk_run_id == bulk_run_id
+        ).delete()
+
+        # Delete associated progress events
+        db.query(BulkProgressEvent).filter(
+            BulkProgressEvent.bulk_run_id == bulk_run_id
+        ).delete()
+
+        # Delete bulk run
+        db.delete(bulk_run)
+        db.commit()
+
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def get_dataset_execution_details(dataset_execution_id: int) -> Optional[Dict[str, Any]]:
+    """Get detailed information about a specific dataset execution"""
+    db = get_db_session()
+    try:
+        dataset_exec = db.query(BulkDatasetExecution).get(dataset_execution_id)
+        if not dataset_exec:
+            return None
+
+        return {
+            'id': dataset_exec.id,
+            'bulk_run_id': dataset_exec.bulk_run_id,
+            'filename': dataset_exec.filename,
+            'execution_order': dataset_exec.execution_order,
+            'status': dataset_exec.status,
+            'current_stage': dataset_exec.current_stage,
+            'eda_completed': dataset_exec.eda_completed,
+            'feature_importance_completed': dataset_exec.feature_importance_completed,
+            'smote_completed': dataset_exec.smote_completed,
+            'models_completed': dataset_exec.models_completed,
+            'shap_completed': dataset_exec.shap_completed,
+            'report_completed': dataset_exec.report_completed,
+            'total_models': dataset_exec.total_models,
+            'completed_models': dataset_exec.completed_models,
+            'model_run_timestamp': dataset_exec.model_run_timestamp,
+            'report_id': dataset_exec.report_id,
+            'started_at': dataset_exec.started_at.isoformat() if dataset_exec.started_at else None,
+            'completed_at': dataset_exec.completed_at.isoformat() if dataset_exec.completed_at else None,
+            'error_stage': dataset_exec.error_stage,
+            'error_message': dataset_exec.error_message,
+            'error_traceback': dataset_exec.error_traceback
+        }
+    finally:
+        db.close()

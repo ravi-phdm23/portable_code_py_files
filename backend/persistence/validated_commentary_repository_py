@@ -1,0 +1,222 @@
+"""
+Validated Commentary Repository.
+
+Handles database operations for validated commentary with evidence layers.
+Stores transparent evidence-based analysis without pass/fail judgments.
+"""
+
+import json
+from typing import Optional, Dict, Any, List
+from persistence.db import get_engine
+from datetime import datetime
+
+
+def save_validated_commentary(
+    filename: str,
+    run_timestamp: str,
+    model_name: str,
+    statistical_evidence: Dict[str, Any],
+    explanatory_evidence: Dict[str, Any],
+    ai_narrative: Dict[str, Any],
+    evidence_summary: str
+) -> None:
+    """
+    Save validated commentary with all evidence layers.
+
+    Args:
+        filename: Dataset filename
+        run_timestamp: Model run timestamp (ISO format)
+        model_name: Name of the model
+        statistical_evidence: Layer 1 evidence (statistical tests)
+        explanatory_evidence: Layer 2 evidence (rank stability, label randomization, etc.)
+        ai_narrative: Layer 3 narrative with metadata
+        evidence_summary: Human-readable summary of all evidence
+    """
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            raw_conn = conn.connection
+            cursor = raw_conn.cursor()
+
+            # Create table if not exists
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS validated_commentary (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    run_timestamp TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    statistical_evidence TEXT,
+                    explanatory_evidence TEXT,
+                    ai_narrative TEXT,
+                    ai_narrative_metadata TEXT,
+                    evidence_summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(filename, run_timestamp, model_name)
+                )
+            ''')
+
+            # Extract narrative and metadata
+            narrative_text = ai_narrative.get('narrative', '')
+            narrative_metadata = ai_narrative.get('generation_metadata', {})
+
+            cursor.execute('''
+                INSERT OR REPLACE INTO validated_commentary
+                (filename, run_timestamp, model_name, statistical_evidence,
+                 explanatory_evidence, ai_narrative, ai_narrative_metadata, evidence_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                filename,
+                run_timestamp,
+                model_name,
+                json.dumps(statistical_evidence) if statistical_evidence else None,
+                json.dumps(explanatory_evidence) if explanatory_evidence else None,
+                narrative_text,
+                json.dumps(narrative_metadata),
+                evidence_summary
+            ))
+
+            raw_conn.commit()
+            print(f"Saved validated commentary for {model_name} on {filename}")
+
+    except Exception as e:
+        print(f"Error saving validated commentary: {e}")
+        raise
+
+
+def load_validated_commentary(
+    filename: str,
+    run_timestamp: Optional[str] = None,
+    model_name: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Load validated commentary from database.
+
+    Args:
+        filename: Dataset filename
+        run_timestamp: Optional model run timestamp
+        model_name: Optional model name
+
+    Returns:
+        Dictionary with all evidence layers, or None if not found
+    """
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            raw_conn = conn.connection
+            cursor = raw_conn.cursor()
+
+            if run_timestamp and model_name:
+                cursor.execute(
+                    '''SELECT * FROM validated_commentary
+                       WHERE filename = ? AND run_timestamp = ? AND model_name = ?''',
+                    (filename, run_timestamp, model_name)
+                )
+            elif run_timestamp:
+                cursor.execute(
+                    '''SELECT * FROM validated_commentary
+                       WHERE filename = ? AND run_timestamp = ?''',
+                    (filename, run_timestamp)
+                )
+            else:
+                cursor.execute(
+                    'SELECT * FROM validated_commentary WHERE filename = ?',
+                    (filename,)
+                )
+
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            return {
+                'id': row[0],
+                'filename': row[1],
+                'run_timestamp': row[2],
+                'model_name': row[3],
+                'statistical_evidence': json.loads(row[4]) if row[4] else None,
+                'explanatory_evidence': json.loads(row[5]) if row[5] else None,
+                'ai_narrative': row[6],
+                'ai_narrative_metadata': json.loads(row[7]) if row[7] else None,
+                'evidence_summary': row[8],
+                'created_at': row[9]
+            }
+
+    except Exception as e:
+        print(f"Error loading validated commentary: {e}")
+        return None
+
+
+def load_all_validated_commentaries(filename: str) -> List[Dict[str, Any]]:
+    """
+    Load all validated commentaries for a dataset.
+
+    Args:
+        filename: Dataset filename
+
+    Returns:
+        List of commentary dictionaries
+    """
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            raw_conn = conn.connection
+            cursor = raw_conn.cursor()
+
+            cursor.execute(
+                'SELECT * FROM validated_commentary WHERE filename = ? ORDER BY created_at DESC',
+                (filename,)
+            )
+
+            rows = cursor.fetchall()
+            commentaries = []
+
+            for row in rows:
+                commentaries.append({
+                    'id': row[0],
+                    'filename': row[1],
+                    'run_timestamp': row[2],
+                    'model_name': row[3],
+                    'statistical_evidence': json.loads(row[4]) if row[4] else None,
+                    'explanatory_evidence': json.loads(row[5]) if row[5] else None,
+                    'ai_narrative': row[6],
+                    'ai_narrative_metadata': json.loads(row[7]) if row[7] else None,
+                    'evidence_summary': row[8],
+                    'created_at': row[9]
+                })
+
+            return commentaries
+
+    except Exception as e:
+        print(f"Error loading all validated commentaries: {e}")
+        return []
+
+
+def delete_validated_commentary(filename: str) -> int:
+    """
+    Delete all validated commentaries for a dataset.
+
+    Args:
+        filename: Dataset filename
+
+    Returns:
+        Number of records deleted
+    """
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            raw_conn = conn.connection
+            cursor = raw_conn.cursor()
+
+            cursor.execute(
+                'DELETE FROM validated_commentary WHERE filename = ?',
+                (filename,)
+            )
+
+            deleted_count = cursor.rowcount
+            raw_conn.commit()
+
+            print(f"Deleted {deleted_count} validated commentary record(s) for {filename}")
+            return deleted_count
+
+    except Exception as e:
+        print(f"Error deleting validated commentary: {e}")
+        return 0

@@ -1,0 +1,55 @@
+"""
+Label Randomization Results Repository.
+Handles database operations for label randomization test results.
+"""
+
+import json
+from typing import Optional, Dict, Any
+from persistence.db import get_engine
+
+
+def load_label_randomization_result(filename: str) -> Optional[Dict[str, Any]]:
+    """
+    Load label randomization test result from database.
+
+    Args:
+        filename: CSV dataset filename
+
+    Returns:
+        Dictionary with randomized SHAP values and metrics, or None if not found
+    """
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            raw_conn = conn.connection
+            cursor = raw_conn.cursor()
+
+            cursor.execute(
+                'SELECT result_data FROM label_randomization_results WHERE filename = ?',
+                (filename,)
+            )
+            row = cursor.fetchone()
+
+            if row is None:
+                return None
+
+            result_data = json.loads(row[0])
+            return result_data
+
+    except Exception as e:
+        print(f"Error loading label randomization result for {filename}: {e}")
+        return None
+
+
+def has_label_randomization_result(filename: str) -> bool:
+    """
+    Check if label randomization result exists for a dataset.
+
+    Args:
+        filename: CSV dataset filename
+
+    Returns:
+        True if result exists, False otherwise
+    """
+    result = load_label_randomization_result(filename)
+    return result is not None

@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "paths": {
+    "database_path": "sqlite:///./uploaded_data.db",
+    "images_dir": "images",
+    "reports_dir": "backend\\reports",
+    "logs_dir": "backend\\logs"
+  },
+  "metadata": {
+    "last_modified": "2025-12-23T06:54:56.100888",
+    "modified_by": "system"
+  }
+}

@@ -1,0 +1,151 @@
+"""
+Report Repository for persisting and retrieving generated LaTeX/PDF reports.
+"""
+
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+import json
+import os
+
+from sqlalchemy.orm import Session
+from persistence.db import HistoricalReport, get_db
+
+
+def save_report(
+    db: Session,
+    report_type: str,
+    source_run_ids: List[str],
+    tex_path: str,
+    pdf_path: Optional[str],
+    metadata: Dict[str, Any]
+) -> HistoricalReport:
+    """
+    Save a generated report to the database.
+    
+    Args:
+        db: Database session
+        report_type: 'individual' or 'combined'
+        source_run_ids: List of run identifiers used to generate report
+        tex_path: Path to .tex file
+        pdf_path: Path to .pdf file (can be None if compilation failed)
+        metadata: Additional metadata (filenames, timestamps, etc.)
+    
+    Returns:
+        Created HistoricalReport instance
+    """
+    report = HistoricalReport(
+        report_type=report_type,
+        source_run_ids=json.dumps(source_run_ids),
+        tex_path=tex_path,
+        pdf_path=pdf_path,
+        timestamp=datetime.now(),
+        report_metadata=json.dumps(metadata)
+    )
+    
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    
+    return report
+
+
+def get_report_by_id(db: Session, report_id: int) -> Optional[HistoricalReport]:
+    """Get a report by its ID."""
+    return db.query(HistoricalReport).filter(HistoricalReport.id == report_id).first()
+
+
+def list_all_reports(db: Session) -> List[HistoricalReport]:
+    """List all generated reports, ordered by timestamp descending."""
+    return db.query(HistoricalReport).order_by(HistoricalReport.timestamp.desc()).all()
+
+
+def delete_report(db: Session, report_id: int) -> bool:
+    """
+    Delete a report from database and filesystem.
+    Only deletes the .tex and .pdf report files, NOT the images.
+    Also cleans up validated_commentary for individual reports.
+
+    Args:
+        db: Database session
+        report_id: Report ID to delete
+
+    Returns:
+        True if deleted successfully, False if not found
+
+    Raises:
+        Exception: If database deletion fails (caller should handle)
+    """
+    report = get_report_by_id(db, report_id)
+
+    if not report:
+        return False
+
+    # For individual reports, delete associated validated_commentary
+    if report.report_type == 'individual':
+        try:
+            metadata = json.loads(report.report_metadata) if report.report_metadata else {}
+            filename = metadata.get('filename')
+            run_timestamp = metadata.get('timestamp')
+
+            if filename and run_timestamp:
+                from persistence.validated_commentary_repository import delete_validated_commentary
+                # Delete all commentaries for this dataset+timestamp combination
+                from persistence.db import get_engine
+                engine = get_engine()
+                with engine.connect() as conn:
+                    raw_conn = conn.connection
+                    cursor = raw_conn.cursor()
+                    cursor.execute(
+                        'DELETE FROM validated_commentary WHERE filename = ? AND run_timestamp = ?',
+                        (filename, run_timestamp)
+                    )
+                    deleted_count = cursor.rowcount
+                    raw_conn.commit()
+                    if deleted_count > 0:
+                        print(f"Deleted {deleted_count} validated commentary record(s) for report {report_id}")
+        except Exception as e:
+            print(f"Warning: Could not delete validated commentary for report {report_id}: {e}")
+
+    # Delete ONLY the report files (.tex and .pdf) from filesystem
+    file_delete_errors = []
+    for path in [report.tex_path, report.pdf_path]:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+                print(f"Deleted file: {path}")
+            except Exception as e:
+                error_msg = f"Could not delete file {path}: {e}"
+                print(f"Warning: {error_msg}")
+                file_delete_errors.append(error_msg)
+
+    # NOTE: We do NOT delete images from the images/ folder because:
+    # 1. Images are shared across multiple reports
+    # 2. Images are used by the main UI visualizations
+    # 3. Images are dataset-level artifacts, not report-specific
+
+    # Delete from database
+    try:
+        db.delete(report)
+        db.commit()
+        print(f"Deleted report {report_id} from database")
+    except Exception as e:
+        # Rollback on database error
+        db.rollback()
+        error_msg = f"Failed to delete report {report_id} from database: {str(e)}"
+        print(f"Error: {error_msg}")
+        raise Exception(error_msg) from e
+
+    return True
+
+
+def report_to_dict(report: HistoricalReport) -> Dict[str, Any]:
+    """Convert HistoricalReport to dictionary for JSON serialization."""
+    return {
+        'id': report.id,
+        'report_type': report.report_type,
+        'source_run_ids': json.loads(report.source_run_ids) if report.source_run_ids else [],
+        'tex_path': report.tex_path,
+        'pdf_path': report.pdf_path,
+        'timestamp': report.timestamp.isoformat() if report.timestamp else None,
+        'metadata': json.loads(report.report_metadata) if report.report_metadata else {}
+    }

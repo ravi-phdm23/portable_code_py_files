@@ -1,0 +1,246 @@
+"""
+Local SHAP Analysis Repository.
+Handles persistence of single-row SHAP analysis results.
+"""
+
+import json
+import numpy as np
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from persistence.db import LocalSHAPAnalysis, get_db_session
+
+
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to native Python types for JSON serialization.
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    return obj
+
+
+def save_local_shap_analysis(
+    filename: str,
+    row_index: int,
+    analysis_data: Dict[str, Any],
+    ai_explanation: Optional[Dict[str, str]] = None,
+    waterfall_plot_path: Optional[str] = None,
+    model_name: Optional[str] = None,
+    run_timestamp: Optional[str] = None
+) -> int:
+    """
+    Save a local SHAP analysis result to database.
+
+    Args:
+        filename: Dataset filename
+        row_index: Row index analyzed
+        analysis_data: Complete analysis result from analyze_single_row()
+        ai_explanation: AI-generated explanation (optional)
+        waterfall_plot_path: Path to waterfall plot
+        model_name: Name of model used
+        run_timestamp: Timestamp of model run
+
+    Returns:
+        ID of the saved record
+    """
+    db = get_db_session()
+    try:
+        # Check if analysis already exists for this row
+        existing = db.query(LocalSHAPAnalysis).filter(
+            LocalSHAPAnalysis.filename == filename,
+            LocalSHAPAnalysis.row_index == row_index
+        ).first()
+
+        # Convert numpy types to Python types before JSON serialization
+        analysis_data_clean = convert_numpy_types(analysis_data)
+        ai_explanation_clean = convert_numpy_types(ai_explanation) if ai_explanation else None
+
+        if existing:
+            # Update existing record
+            existing.analysis_data = json.dumps(analysis_data_clean)
+            existing.ai_explanation = json.dumps(ai_explanation_clean) if ai_explanation_clean else None
+            existing.waterfall_plot_path = waterfall_plot_path
+            existing.model_name = model_name
+            existing.run_timestamp = run_timestamp
+            existing.timestamp = datetime.now()
+            db.commit()
+            db.refresh(existing)
+            return existing.id
+        else:
+            # Create new record
+            analysis = LocalSHAPAnalysis(
+                filename=filename,
+                row_index=row_index,
+                analysis_data=json.dumps(analysis_data_clean),
+                ai_explanation=json.dumps(ai_explanation_clean) if ai_explanation_clean else None,
+                waterfall_plot_path=waterfall_plot_path,
+                model_name=model_name,
+                run_timestamp=run_timestamp,
+                timestamp=datetime.now()
+            )
+            db.add(analysis)
+            db.commit()
+            db.refresh(analysis)
+            return analysis.id
+    finally:
+        db.close()
+
+
+def load_local_shap_analysis(filename: str, row_index: int) -> Optional[Dict[str, Any]]:
+    """
+    Load a local SHAP analysis from database.
+
+    Args:
+        filename: Dataset filename
+        row_index: Row index
+
+    Returns:
+        Complete analysis result dictionary, or None if not found
+    """
+    db = get_db_session()
+    try:
+        result = db.query(LocalSHAPAnalysis).filter(
+            LocalSHAPAnalysis.filename == filename,
+            LocalSHAPAnalysis.row_index == row_index
+        ).order_by(LocalSHAPAnalysis.timestamp.desc()).first()
+
+        if result:
+            data = json.loads(result.analysis_data)
+
+            # Add AI explanation if available
+            if result.ai_explanation:
+                data['ai_explanation'] = json.loads(result.ai_explanation)
+
+            # Add metadata
+            data['db_id'] = result.id
+            data['db_timestamp'] = result.timestamp.isoformat()
+
+            return data
+        return None
+    finally:
+        db.close()
+
+
+def list_local_shap_analyses(filename: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    List all local SHAP analyses for a dataset.
+
+    Args:
+        filename: Dataset filename
+        limit: Maximum number of results to return
+
+    Returns:
+        List of analysis summary dictionaries
+    """
+    db = get_db_session()
+    try:
+        results = db.query(LocalSHAPAnalysis).filter(
+            LocalSHAPAnalysis.filename == filename
+        ).order_by(LocalSHAPAnalysis.timestamp.desc()).limit(limit).all()
+
+        summaries = []
+        for r in results:
+            analysis_data = json.loads(r.analysis_data)
+            summaries.append({
+                'id': r.id,
+                'row_index': r.row_index,
+                'predicted_prob': analysis_data.get('predicted_prob'),
+                'actual_target': analysis_data.get('actual_target'),
+                'model_name': r.model_name,
+                'waterfall_plot': r.waterfall_plot_path,
+                'has_ai_explanation': r.ai_explanation is not None,
+                'timestamp': r.timestamp.isoformat()
+            })
+
+        return summaries
+    finally:
+        db.close()
+
+
+def get_local_shap_analysis_by_id(analysis_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Get a specific local SHAP analysis by ID.
+
+    Args:
+        analysis_id: Database ID of the analysis
+
+    Returns:
+        Complete analysis result dictionary, or None if not found
+    """
+    db = get_db_session()
+    try:
+        result = db.query(LocalSHAPAnalysis).filter(
+            LocalSHAPAnalysis.id == analysis_id
+        ).first()
+
+        if result:
+            data = json.loads(result.analysis_data)
+
+            if result.ai_explanation:
+                data['ai_explanation'] = json.loads(result.ai_explanation)
+
+            data['db_id'] = result.id
+            data['db_timestamp'] = result.timestamp.isoformat()
+            data['filename'] = result.filename
+
+            return data
+        return None
+    finally:
+        db.close()
+
+
+def delete_local_shap_analysis(filename: str, row_index: Optional[int] = None) -> int:
+    """
+    Delete local SHAP analysis results.
+
+    Args:
+        filename: Dataset filename
+        row_index: Specific row index to delete (if None, deletes all for dataset)
+
+    Returns:
+        Number of records deleted
+    """
+    db = get_db_session()
+    try:
+        query = db.query(LocalSHAPAnalysis).filter(
+            LocalSHAPAnalysis.filename == filename
+        )
+
+        if row_index is not None:
+            query = query.filter(LocalSHAPAnalysis.row_index == row_index)
+
+        count = query.delete()
+        db.commit()
+        return count
+    finally:
+        db.close()
+
+
+def check_local_shap_cached(filename: str, row_index: int) -> bool:
+    """
+    Check if a local SHAP analysis is cached for a specific row.
+
+    Args:
+        filename: Dataset filename
+        row_index: Row index
+
+    Returns:
+        True if cached, False otherwise
+    """
+    db = get_db_session()
+    try:
+        count = db.query(LocalSHAPAnalysis).filter(
+            LocalSHAPAnalysis.filename == filename,
+            LocalSHAPAnalysis.row_index == row_index
+        ).count()
+        return count > 0
+    finally:
+        db.close()

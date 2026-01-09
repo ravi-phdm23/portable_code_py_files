@@ -1,0 +1,376 @@
+"""
+Repository for CSV dataset storage and retrieval.
+Handles CSV rows and metadata persistence.
+"""
+
+import json
+from datetime import datetime
+from persistence.db import CSVMetadata, CSVRow, get_db_session
+from services.dataset_quality import build_dataset_quality_summary
+from persistence.dataset_quality_repo import save_dataset_quality_summary, load_dataset_quality_summary
+
+
+def save_csv_data(filename, df, target_column):
+    """
+    Save CSV data to database.
+    Overwrites existing data AND invalidates all derived analysis artifacts.
+
+    Returns metadata dict with filename, rows, columns, target_column.
+    """
+    db = get_db_session()
+
+    try:
+        # Import here to avoid circular dependency
+        from persistence.db import (
+            PandasResult,
+            ImageMetadata,
+            FeatureImportanceResult,
+            SMOTEResult,
+            DatasetQualitySummary,   # ✅ Table X
+            CSVRow,
+            CSVMetadata
+        )
+
+        # --------------------------------------------------
+        # 1. Invalidate existing data + ALL derived artifacts
+        # --------------------------------------------------
+        db.query(CSVRow).filter(CSVRow.filename == filename).delete()
+        db.query(PandasResult).filter(PandasResult.filename == filename).delete()
+        db.query(ImageMetadata).filter(ImageMetadata.filename == filename).delete()
+        db.query(FeatureImportanceResult).filter(
+            FeatureImportanceResult.filename == filename
+        ).delete()
+        db.query(SMOTEResult).filter(SMOTEResult.filename == filename).delete()
+
+        # 🔴 Critical addition: invalidate Table X
+        db.query(DatasetQualitySummary).filter(
+            DatasetQualitySummary.filename == filename
+        ).delete()
+
+        db.query(CSVMetadata).filter(CSVMetadata.filename == filename).delete()
+
+        # --------------------------------------------------
+        # 2. Store raw CSV rows
+        # --------------------------------------------------
+        for _, row in df.iterrows():
+            row_dict = row.to_dict()
+
+            # Convert numpy scalars → Python types
+            for key, value in row_dict.items():
+                if hasattr(value, "item"):
+                    row_dict[key] = value.item()
+
+            csv_row = CSVRow(
+                filename=filename,
+                row_data=json.dumps(row_dict)
+            )
+            db.add(csv_row)
+
+        # --------------------------------------------------
+        # 3. Store dataset-level metadata
+        # --------------------------------------------------
+        metadata = CSVMetadata(
+            filename=filename,
+            upload_timestamp=datetime.now(),
+            total_rows=len(df),
+            total_columns=len(df.columns),
+            target_column=target_column
+        )
+        db.add(metadata)
+
+        # --------------------------------------------------
+        # 4. Build + persist Table X
+        # --------------------------------------------------
+        table_x_rows = build_dataset_quality_summary(df)
+        save_dataset_quality_summary(
+            db=db,
+            filename=filename,
+            table_rows=table_x_rows
+        )
+
+
+        db.commit()
+
+        return {
+            "filename": filename,
+            "total_rows": len(df),
+            "total_columns": len(df.columns),
+            "target_column": target_column
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise e
+
+    finally:
+        db.close()
+
+
+def load_csv_data(filename):
+    """
+    Load CSV data from database.
+    Returns DataFrame or None if not found.
+    """
+    import pandas as pd
+
+    db = get_db_session()
+    try:
+        stored_rows = db.query(CSVRow).filter(CSVRow.filename == filename).all()
+        if not stored_rows:
+            return None
+
+        rows_data = [json.loads(row.row_data) for row in stored_rows]
+        return pd.DataFrame(rows_data)
+
+    finally:
+        db.close()
+
+
+def get_dataset_metadata(filename):
+    """
+    Get metadata for a specific dataset.
+    Returns dict or None if not found.
+    """
+    db = get_db_session()
+    try:
+        metadata = db.query(CSVMetadata).filter(CSVMetadata.filename == filename).first()
+        if not metadata:
+            return None
+
+        return {
+            "filename": metadata.filename,
+            "upload_timestamp": metadata.upload_timestamp.isoformat(),
+            "total_rows": metadata.total_rows,
+            "total_columns": metadata.total_columns,
+            "target_column": metadata.target_column
+        }
+
+    finally:
+        db.close()
+
+
+def check_dataset_exists(filename):
+    """Check if dataset with filename exists"""
+    db = get_db_session()
+    try:
+        exists = db.query(CSVMetadata).filter(CSVMetadata.filename == filename).first() is not None
+        return exists
+    finally:
+        db.close()
+
+
+def list_all_datasets():
+    """
+    List all datasets with metadata, including analysis status.
+    Returns list of metadata dicts.
+    """
+    db = get_db_session()
+    try:
+        # Import here to avoid circular dependency
+        from persistence.db import FeatureImportanceResult, SMOTEResult
+
+        all_metadata = db.query(CSVMetadata).order_by(CSVMetadata.upload_timestamp.desc()).all()
+
+        datasets = []
+        for metadata in all_metadata:
+            # Check if feature importance exists
+            has_feature_importance = db.query(FeatureImportanceResult).filter(
+                FeatureImportanceResult.filename == metadata.filename
+            ).first() is not None
+
+            # Check if SMOTE analysis exists
+            smote_result = db.query(SMOTEResult).filter(
+                SMOTEResult.filename == metadata.filename
+            ).first()
+
+            has_smote = smote_result is not None
+            smote_applied = False
+            if has_smote:
+                import json
+                smote_data = json.loads(smote_result.result_data)
+                smote_applied = smote_data.get('applied', False)
+
+            datasets.append({
+                "filename": metadata.filename,
+                "upload_timestamp": metadata.upload_timestamp.isoformat(),
+                "total_rows": metadata.total_rows,
+                "total_columns": metadata.total_columns,
+                "target_column": metadata.target_column,
+                "has_feature_importance": has_feature_importance,
+                "has_smote": has_smote,
+                "smote_applied": smote_applied
+            })
+
+        return datasets
+
+    finally:
+        db.close()
+
+
+def get_most_recent_filename():
+    """Get the most recently uploaded filename"""
+    db = get_db_session()
+    try:
+        latest = db.query(CSVMetadata).order_by(CSVMetadata.upload_timestamp.desc()).first()
+        return latest.filename if latest else None
+    finally:
+        db.close()
+
+
+def delete_dataset(filename):
+    """
+    Delete dataset and all associated data from database.
+    Returns True if deleted, False if not found.
+    """
+    db = get_db_session()
+    try:
+        # Import here to avoid circular dependency
+        from persistence.db import (
+            PandasResult, ImageMetadata, FeatureImportanceResult, SMOTEResult,
+            ModelResult, GroupBestResult, BenchmarkResult, SHAPResult, LocalSHAPAnalysis,
+            StatisticalTestResult, HistoricalReport, DatasetQualitySummary
+        )
+        from bulk_execution.models import BulkDatasetExecution, BulkProgressEvent
+
+        # Check if exists
+        metadata = db.query(CSVMetadata).filter(CSVMetadata.filename == filename).first()
+        if not metadata:
+            return False
+
+        # Delete all associated data (in order to handle foreign key constraints if any)
+        db.query(CSVRow).filter(CSVRow.filename == filename).delete()
+        db.query(PandasResult).filter(PandasResult.filename == filename).delete()
+        db.query(ImageMetadata).filter(ImageMetadata.filename == filename).delete()
+        db.query(FeatureImportanceResult).filter(FeatureImportanceResult.filename == filename).delete()
+        db.query(SMOTEResult).filter(SMOTEResult.filename == filename).delete()
+
+        # Delete quality summary
+        db.query(DatasetQualitySummary).filter(DatasetQualitySummary.filename == filename).delete()
+
+        # Delete model-related data
+        db.query(ModelResult).filter(ModelResult.filename == filename).delete()
+        db.query(GroupBestResult).filter(GroupBestResult.filename == filename).delete()
+        db.query(BenchmarkResult).filter(BenchmarkResult.filename == filename).delete()
+
+        # Delete SHAP results (global)
+        db.query(SHAPResult).filter(SHAPResult.filename == filename).delete()
+
+        # Delete Local SHAP analyses (prediction tests)
+        local_shap_count = db.query(LocalSHAPAnalysis).filter(LocalSHAPAnalysis.filename == filename).count()
+        db.query(LocalSHAPAnalysis).filter(LocalSHAPAnalysis.filename == filename).delete()
+        if local_shap_count > 0:
+            print(f"Deleted {local_shap_count} Local SHAP analysis records for '{filename}'")
+
+        # Delete statistical test results
+        stats_count = db.query(StatisticalTestResult).filter(StatisticalTestResult.filename == filename).count()
+        db.query(StatisticalTestResult).filter(StatisticalTestResult.filename == filename).delete()
+        if stats_count > 0:
+            print(f"Deleted {stats_count} statistical test results for '{filename}'")
+
+        # Delete historical reports (database records and PDF/TEX files)
+        # Note: HistoricalReport stores filenames in report_metadata JSON field
+        import os
+        import json
+
+        all_reports = db.query(HistoricalReport).all()
+        reports_to_delete = []
+
+        for report in all_reports:
+            try:
+                if report.report_metadata:
+                    metadata = json.loads(report.report_metadata)
+                    filenames_in_report = metadata.get('filenames', [])
+
+                    # Check if this report includes the filename being deleted
+                    if isinstance(filenames_in_report, list):
+                        if filename in filenames_in_report:
+                            reports_to_delete.append(report)
+                    else:
+                        # Single filename case
+                        report_filename = metadata.get('filename')
+                        if report_filename == filename:
+                            reports_to_delete.append(report)
+            except:
+                # If we can't parse metadata, skip this report
+                pass
+
+        if reports_to_delete:
+            for report in reports_to_delete:
+                # Delete report files (.tex and .pdf) from filesystem
+                for path in [report.tex_path, report.pdf_path]:
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                            print(f"Deleted report file: {path}")
+                        except Exception as e:
+                            print(f"Warning: Could not delete report file {path}: {e}")
+
+                # Delete from database
+                db.delete(report)
+
+            db.flush()
+            print(f"Deleted {len(reports_to_delete)} historical reports for '{filename}'")
+
+        # Delete bulk execution data for this dataset
+        # First, get all dataset executions for this filename to get their IDs
+        bulk_executions = db.query(BulkDatasetExecution).filter(
+            BulkDatasetExecution.filename == filename
+        ).all()
+
+        if bulk_executions:
+            dataset_execution_ids = [exec.id for exec in bulk_executions]
+
+            # Delete progress events for these executions
+            for exec_id in dataset_execution_ids:
+                db.query(BulkProgressEvent).filter(
+                    BulkProgressEvent.dataset_execution_id == exec_id
+                ).delete()
+
+            # Delete the dataset executions themselves
+            bulk_exec_count = db.query(BulkDatasetExecution).filter(
+                BulkDatasetExecution.filename == filename
+            ).delete()
+
+            if bulk_exec_count > 0:
+                print(f"Deleted {bulk_exec_count} bulk execution records for '{filename}'")
+
+        # Delete label randomization results (raw SQL table)
+        try:
+            raw_conn = db.get_bind().raw_connection()
+            cursor = raw_conn.cursor()
+            cursor.execute(
+                'DELETE FROM label_randomization_results WHERE filename = ?',
+                (filename,)
+            )
+            deleted_randomization = cursor.rowcount
+            if deleted_randomization > 0:
+                print(f"Deleted {deleted_randomization} label randomization result(s) for '{filename}'")
+            raw_conn.commit()
+            cursor.close()
+        except Exception as e:
+            # Table might not exist, which is fine
+            print(f"Note: Could not delete label randomization results (table may not exist): {e}")
+
+        # Finally, delete the metadata
+        db.query(CSVMetadata).filter(CSVMetadata.filename == filename).delete()
+
+        db.commit()
+        return True
+
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def get_dataset_quality_summary(filename):
+    """
+    Get dataset quality summary (Table X) for a specific dataset.
+    Returns list of row dicts or None if not found.
+    """
+    db = get_db_session()
+    try:
+        return load_dataset_quality_summary(db, filename)
+    finally:
+        db.close()

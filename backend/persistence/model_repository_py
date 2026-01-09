@@ -1,0 +1,537 @@
+"""
+Repository for model execution results storage and retrieval.
+Handles persistence of model runs and their metrics.
+"""
+
+import json
+from datetime import datetime
+from persistence.db import ModelResult, get_db_session
+from persistence.db import GroupBestResult, BenchmarkResult
+
+
+def save_model_result(filename, model_name, use_smote, selected_features, metrics, timestamp=None, model_group=None, execution_time=None, execution_success=True, error_message=None, model_path=None):
+    """
+    Save a model execution result.
+
+    Args:
+        filename: Dataset filename
+        model_name: Full descriptive model name (e.g., "Logistic Regression (L2, LBFGS)")
+        use_smote: Boolean indicating if SMOTE was used
+        selected_features: List of feature names
+        metrics: Dict of metrics
+        timestamp: Optional timestamp (defaults to now)
+        model_group: Optional model group name (e.g., "Logistic Regression")
+        execution_time: Time taken to execute model in seconds
+        execution_success: Boolean indicating if execution was successful
+        error_message: Error message if execution failed
+        model_path: Optional path to saved model file (e.g., "models/model.pkl")
+
+    Returns:
+        result_id: ID of the saved result
+    """
+    db = get_db_session()
+    try:
+        result = ModelResult(
+            filename=filename,
+            model_name=model_name,
+            model_group=model_group,
+            use_smote=1 if use_smote else 0,
+            selected_features=json.dumps(selected_features),
+            metrics=json.dumps(metrics) if metrics else None,
+            timestamp=timestamp or datetime.now(),
+            execution_time=execution_time,
+            execution_success=1 if execution_success else 0,
+            error_message=error_message,
+            model_path=model_path
+        )
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result.id
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def _normalize_selected_features(raw):
+    """
+    Normalize stored `selected_features` value to a plain list of base features.
+
+    The system historically stored either:
+      - a JSON list of feature names, or
+      - a JSON object like {"base": [...], "transformed": [...]}
+
+    This helper returns the `base` list when present, otherwise attempts to
+    return a sensible list or an empty list.
+    """
+    if raw is None:
+        return []
+    # If it's already a list, assume it's the base list
+    if isinstance(raw, list):
+        return raw
+    # If it's a dict with 'base', prefer that
+    if isinstance(raw, dict):
+        if 'base' in raw and isinstance(raw['base'], list):
+            return raw['base']
+        # legacy: maybe values themselves are lists -> return first list value
+        for v in raw.values():
+            if isinstance(v, list):
+                return v
+        return []
+    # Fallback: try to coerce to list if possible
+    try:
+        return list(raw)
+    except Exception:
+        return []
+
+
+def load_model_results(filename):
+    """
+    Load all model results for a dataset.
+
+    Returns:
+        List of dicts with model results
+    """
+    db = get_db_session()
+    try:
+        # Check if execution metadata columns exist
+        from sqlalchemy import inspect
+        inspector = inspect(db.bind)
+        columns = [col['name'] for col in inspector.get_columns('model_results')]
+        has_execution_cols = 'execution_time' in columns
+
+        # Build query selecting only existing columns
+        if has_execution_cols:
+            results = db.query(ModelResult).filter(
+                ModelResult.filename == filename
+            ).order_by(ModelResult.timestamp.desc()).all()
+        else:
+            # Query without execution metadata columns
+            from sqlalchemy import select
+            stmt = select(
+                ModelResult.id,
+                ModelResult.filename,
+                ModelResult.model_name,
+                ModelResult.model_group,
+                ModelResult.use_smote,
+                ModelResult.selected_features,
+                ModelResult.metrics,
+                ModelResult.timestamp
+            ).where(ModelResult.filename == filename).order_by(ModelResult.timestamp.desc())
+            results = db.execute(stmt).all()
+
+        result_list = []
+        for result in results:
+            if has_execution_cols:
+                result_list.append({
+                    'id': result.id,
+                    'filename': result.filename,
+                    'model_name': result.model_name,
+                    'model_group': result.model_group,
+                    'use_smote': bool(result.use_smote),
+                    'selected_features': _normalize_selected_features(json.loads(result.selected_features)),
+                    'metrics': json.loads(result.metrics) if result.metrics else None,
+                    'timestamp': result.timestamp.isoformat(),
+                    'execution_time': result.execution_time,
+                    'execution_success': bool(result.execution_success),
+                    'error_message': result.error_message,
+                    'model_path': result.model_path if hasattr(result, 'model_path') else None
+                })
+            else:
+                result_list.append({
+                    'id': result.id,
+                    'filename': result.filename,
+                    'model_name': result.model_name,
+                    'model_group': result.model_group,
+                    'use_smote': bool(result.use_smote),
+                    'selected_features': _normalize_selected_features(json.loads(result.selected_features)),
+                    'metrics': json.loads(result.metrics) if result.metrics else None,
+                    'timestamp': result.timestamp.isoformat(),
+                    'execution_time': None,
+                    'execution_success': True,
+                    'error_message': None,
+                    'model_path': None
+                })
+
+        return result_list
+    finally:
+        db.close()
+
+
+def save_group_best_result(filename, run_timestamp, model_group, model_name, metrics):
+    """
+    Persist the best model for a group for a specific run.
+    """
+    db = get_db_session()
+    try:
+        entry = GroupBestResult(
+            filename=filename,
+            run_timestamp=run_timestamp,
+            model_group=model_group,
+            model_name=model_name,
+            metrics=json.dumps(metrics)
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return entry.id
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def save_benchmark_result(filename, run_timestamp, model_group, model_name, metrics):
+    """
+    Persist the single benchmark (best overall) model for a specific run.
+    """
+    db = get_db_session()
+    try:
+        entry = BenchmarkResult(
+            filename=filename,
+            run_timestamp=run_timestamp,
+            model_group=model_group,
+            model_name=model_name,
+            metrics=json.dumps(metrics),
+            is_benchmark=1
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return entry.id
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def load_group_bests(filename, run_timestamp):
+    """
+    Load best-in-group persisted rows for a specific run (returns list of dicts).
+    """
+    db = get_db_session()
+    try:
+        entries = db.query(GroupBestResult).filter(
+            GroupBestResult.filename == filename,
+            GroupBestResult.run_timestamp == run_timestamp
+        ).all()
+
+        out = []
+        for e in entries:
+            out.append({
+                'model_group': e.model_group,
+                'model_name': e.model_name,
+                'metrics': json.loads(e.metrics)
+            })
+        return out
+    finally:
+        db.close()
+
+
+def load_benchmark_for_run(filename, run_timestamp):
+    """
+    Load all group-wise best model results for a specific run.
+    Returns a list of dicts (one per model group).
+    """
+    db = get_db_session()
+    try:
+        rows = (
+            db.query(GroupBestResult)
+              .filter(
+                  GroupBestResult.filename == filename,
+                  GroupBestResult.run_timestamp == run_timestamp
+              )
+              .order_by(GroupBestResult.model_group)
+              .all()
+        )
+
+        if not rows:
+            return []
+
+        results = []
+        for r in rows:
+            results.append({
+                "model_group": r.model_group,
+                "model_name": r.model_name,
+                "metrics": json.loads(r.metrics)
+            })
+
+        return results
+
+    finally:
+        db.close()
+
+
+# def load_benchmark_for_run(filename, run_timestamp):
+#     """
+#     Load the benchmark model persisted for a specific run. Returns dict or None.
+#     """
+#     db = get_db_session()
+#     try:
+#         e = db.query(BenchmarkResult).filter(
+#             BenchmarkResult.filename == filename,
+#             BenchmarkResult.run_timestamp == run_timestamp,
+#             BenchmarkResult.is_benchmark == 1
+#         ).first()
+#         if not e:
+#             return None
+#         return {
+#             'model_group': e.model_group,
+#             'model_name': e.model_name,
+#             'metrics': json.loads(e.metrics)
+#         }
+#     finally:
+#         db.close()
+
+
+def list_all_model_runs():
+    """
+    List unique model runs across all datasets.
+    Returns distinct combinations of (filename, timestamp) with aggregated metadata.
+    
+    Returns:
+        List of dicts with unique run metadata
+    """
+    db = get_db_session()
+    try:
+        from sqlalchemy import func, distinct
+        
+        # Get distinct filename + timestamp combinations with aggregated data
+        results = db.query(
+            ModelResult.filename,
+            ModelResult.timestamp,
+            ModelResult.use_smote,
+            func.count(ModelResult.id).label('model_count')
+        ).group_by(
+            ModelResult.filename,
+            ModelResult.timestamp,
+            ModelResult.use_smote
+        ).order_by(
+            ModelResult.filename,
+            ModelResult.timestamp.desc()
+        ).all()
+
+        runs = []
+        for result in results:
+            runs.append({
+                'filename': result.filename,
+                'timestamp': result.timestamp.isoformat(),
+                'use_smote': bool(result.use_smote),
+                'model_count': result.model_count
+            })
+
+        return runs
+
+    finally:
+        db.close()
+
+
+def get_model_run_details(filename, timestamp):
+    """
+    Get detailed information for all models in a specific run (filename + timestamp).
+    
+    Args:
+        filename: Dataset filename
+        timestamp: Run timestamp (ISO format string or datetime object)
+    
+    Returns:
+        Dict with complete run information including all models, best models, and benchmark
+    """
+    db = get_db_session()
+    try:
+        # Convert timestamp string to datetime if needed
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp)
+        
+        # Get all models for this run
+        results = db.query(ModelResult).filter(
+            ModelResult.filename == filename,
+            ModelResult.timestamp == timestamp
+        ).all()
+        
+        if not results:
+            return None
+        
+        # Build list of all models
+        all_models = []
+        use_smote = False
+        selected_features = []
+        
+        for result in results:
+            use_smote = bool(result.use_smote)
+            selected_features = _normalize_selected_features(json.loads(result.selected_features))
+            
+            all_models.append({
+                'id': result.id,
+                'model_name': result.model_name,
+                'model_group': result.model_group,
+                'metrics': json.loads(result.metrics)
+            })
+        
+        # Get best models by group
+        group_bests = load_group_bests(filename, timestamp)
+        
+        # Mark best models in the all_models list
+        for model in all_models:
+            model['is_best_in_group'] = any(
+                gb['model_name'] == model['model_name'] and 
+                gb['model_group'] == model['model_group']
+                for gb in group_bests
+            )
+        
+        # Get benchmark model
+        benchmark = load_benchmark_for_run(filename, timestamp)
+        
+        return {
+            'filename': filename,
+            'timestamp': timestamp.isoformat(),
+            'use_smote': use_smote,
+            'selected_features': selected_features,
+            'all_models': all_models,
+            'best_models_by_group': group_bests,
+            'benchmark_model': benchmark
+        }
+
+    finally:
+        db.close()
+
+
+def get_model_run_details_by_id(run_id):
+    """
+    Get detailed information about a specific model run by ID.
+    
+    Returns:
+        Dict with complete run information
+    """
+    db = get_db_session()
+    try:
+        result = db.query(ModelResult).filter(ModelResult.id == run_id).first()
+        
+        if not result:
+            return None
+
+        return {
+            'id': result.id,
+            'filename': result.filename,
+            'model_group': result.model_group,
+            'model_name': result.model_name,
+            'use_smote': bool(result.use_smote),
+            'selected_features': _normalize_selected_features(json.loads(result.selected_features)),
+            'metrics': json.loads(result.metrics),
+            'timestamp': result.timestamp.isoformat()
+        }
+
+    finally:
+        db.close()
+
+
+def delete_model_results(filename):
+    """
+    Delete all model results for a dataset.
+    
+    Returns:
+        Number of deleted results
+    """
+    db = get_db_session()
+    try:
+        count = db.query(ModelResult).filter(
+            ModelResult.filename == filename
+        ).delete()
+        db.commit()
+        return count
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def delete_model_run(run_id):
+    """
+    Delete a specific model run by ID.
+    
+    Returns:
+        True if deleted, False if not found
+    """
+    db = get_db_session()
+    try:
+        result = db.query(ModelResult).filter(ModelResult.id == run_id).first()
+        if result:
+            db.delete(result)
+            db.commit()
+            return True
+        return False
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        db.close()
+
+
+def normalize_all_model_runs_to_base():
+    """
+    Migrate existing model run records so that `selected_features` stores base feature names.
+    Uses cached feature importance results (rf_table or lr_table) to map transformed -> base.
+    Returns count of updated records.
+    """
+    db = get_db_session()
+    try:
+        results = db.query(ModelResult).all()
+        updated = 0
+
+        for res in results:
+            try:
+                filename = res.filename
+                # Load feature importance cached results for mapping
+                from persistence.analysis_repository import load_all_feature_importance_results
+                fi = load_all_feature_importance_results(filename)
+                rf_table = fi.get('rf_table') or []
+                lr_table = fi.get('lr_table') or []
+
+                mapping = {}
+                for item in rf_table:
+                    mapping[item.get('feature')] = item.get('base_feature') or item.get('feature')
+                for item in lr_table:
+                    mapping.setdefault(item.get('feature'), item.get('base_feature') or item.get('feature'))
+
+                # Parse stored selected features
+                stored = json.loads(res.selected_features)
+                # Map each feature to base if possible, otherwise keep if already base
+                mapped = []
+                seen = set()
+                # Also prepare list of merged base features from fi (if available)
+                merged_bases = []
+                if fi.get('merged_table'):
+                    merged_bases = [m.get('feature') for m in fi['merged_table']]
+
+                for f in stored:
+                    base = mapping.get(f)
+                    if base:
+                        candidate = base
+                    else:
+                        # if f already looks like a base feature present in merged_bases, keep it
+                        candidate = f if f in merged_bases else f
+
+                    if candidate not in seen:
+                        mapped.append(candidate)
+                        seen.add(candidate)
+
+                # If mapping changes, update the record
+                if mapped and json.dumps(mapped) != res.selected_features:
+                    res.selected_features = json.dumps(mapped)
+                    db.add(res)
+                    updated += 1
+            except Exception:
+                # skip problematic records
+                continue
+
+        if updated > 0:
+            db.commit()
+
+        return updated
+    finally:
+        db.close()

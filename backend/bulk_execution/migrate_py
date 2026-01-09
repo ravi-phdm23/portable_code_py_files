@@ -1,0 +1,62 @@
+"""
+Database Migration Script for Bulk Execution Module
+
+Creates the three new tables required for bulk execution tracking.
+Safe to run multiple times (idempotent).
+"""
+
+import sys
+import os
+
+# Add backend directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from persistence.db import Base, get_db_session
+from bulk_execution.models import BulkExecutionRun, BulkDatasetExecution, BulkProgressEvent
+
+
+def migrate():
+    """Create bulk execution tables"""
+    print("=" * 60)
+    print("Bulk Execution Module - Database Migration")
+    print("=" * 60)
+    print()
+
+    print("Creating bulk execution tables...")
+    print("  - bulk_execution_runs")
+    print("  - bulk_dataset_executions")
+    print("  - bulk_progress_events")
+    print()
+
+    try:
+        # Get database session to initialize engine
+        db = get_db_session()
+        try:
+            # Create all tables (will skip existing ones)
+            from persistence.db import engine
+            Base.metadata.create_all(bind=engine)
+
+            print("SUCCESS: Migration completed successfully!")
+            print()
+            print("Tables created:")
+            print(f"  - {BulkExecutionRun.__tablename__}")
+            print(f"  - {BulkDatasetExecution.__tablename__}")
+            print(f"  - {BulkProgressEvent.__tablename__}")
+            print()
+            print("You can now start the backend server and use bulk execution.")
+            print("=" * 60)
+
+            return True
+        finally:
+            db.close()
+
+    except Exception as e:
+        print(f"FAILED: Migration failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+if __name__ == "__main__":
+    success = migrate()
+    sys.exit(0 if success else 1)

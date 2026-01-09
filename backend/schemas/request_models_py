@@ -1,0 +1,83 @@
+"""
+Pydantic request models for API endpoints.
+Defines the shape of incoming request data.
+"""
+
+from pydantic import BaseModel
+from typing import List
+
+
+class OverwriteRequest(BaseModel):
+    filename: str
+    overwrite: bool
+
+
+class FeatureImportanceRequest(BaseModel):
+    filename: str
+
+
+class SMOTERequest(BaseModel):
+    filename: str
+    selected_features: List[str]
+    apply_smote: bool
+
+
+class RunModelsRequest(BaseModel):
+    filename: str
+    selected_features: List[str]
+    target: str = "target"
+    use_smote: bool
+    # DEPRECATED: Use selected_model_groups instead
+    selected_models: List[str] = None
+    # NEW: Proper model group selection
+    selected_model_groups: dict = None  # {group_name: [variant_names]}
+
+
+class SHAPAnalysisRequest(BaseModel):
+    filename: str
+    selected_features: List[str]
+    target: str = "target"
+    n_trials: int = 5
+    bg_size: int = 20
+    use_smote: bool = False  # Whether to apply SMOTE during model training
+    model_selection: List[dict] = None  # List of {model_name, run_timestamp} for multi-model analysis
+
+
+class StatisticalTestRequest(BaseModel):
+    model_config = {'protected_namespaces': ()}
+
+    filename: str
+    run_timestamp: str  # ISO format datetime string
+    model_pairs: List[dict]  # List of {model_1_name, model_2_name}
+    test_types: List[str]  # ["wilcoxon", "mcnemar", "delong"]
+    selected_features: List[str]
+    target: str = "target"
+    use_smote: bool = False
+
+
+class ValidatedExplanationRequest(BaseModel):
+    """Request for generating validated explanation narrative"""
+    filename: str
+    model_name: str
+    run_timestamp: str  # ISO format datetime string
+    use_shap_cache: bool = True  # If True, loads cached SHAP results; if False, runs new analysis
+
+
+class LabelRandomizationRequest(BaseModel):
+    """Request for generating label randomization test data"""
+    filename: str
+    selected_features: List[str]
+    target: str = "target"
+    n_samples: int = 50
+    random_state: int = 42
+
+
+class LocalSHAPRequest(BaseModel):
+    """Request for local (single-row) SHAP analysis"""
+    filename: str
+    row_index: int
+    run_timestamp: str = None  # Optional: specific model run to use
+    n_trials: int = 3  # Number of trials for reliability testing
+    bg_size: int = 30  # Background sample size
+    generate_ai_explanation: bool = True  # Whether to generate AI explanation
+

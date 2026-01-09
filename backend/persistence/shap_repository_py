@@ -1,0 +1,124 @@
+"""
+SHAP Analysis Repository.
+Handles persistence of SHAP analysis results.
+"""
+
+import json
+import math
+from datetime import datetime
+from persistence.db import SHAPResult, get_db_session
+
+
+def _sanitize_for_json(obj):
+    """Recursively replace NaN/Inf values with None for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    return obj
+
+
+def save_shap_result(filename: str, result_data: dict) -> int:
+    """
+    Save SHAP analysis result to database.
+    Overwrites any existing result for the same filename.
+    
+    Args:
+        filename: Dataset filename
+        result_data: SHAP analysis result dictionary
+    
+    Returns:
+        ID of the saved record
+    """
+    db = get_db_session()
+    try:
+        # Delete existing results for this filename
+        db.query(SHAPResult).filter(SHAPResult.filename == filename).delete()
+        
+        # Sanitize data before JSON serialization
+        sanitized_data = _sanitize_for_json(result_data)
+        
+        # Create new result
+        result = SHAPResult(
+            filename=filename,
+            result_data=json.dumps(sanitized_data),
+            timestamp=datetime.now()
+        )
+        db.add(result)
+        db.commit()
+        db.refresh(result)
+        return result.id
+    finally:
+        db.close()
+
+
+def load_shap_result(filename: str) -> dict:
+    """
+    Load SHAP analysis result from database.
+    
+    Args:
+        filename: Dataset filename
+    
+    Returns:
+        SHAP analysis result dictionary, or None if not found
+    """
+    db = get_db_session()
+    try:
+        result = db.query(SHAPResult).filter(
+            SHAPResult.filename == filename
+        ).order_by(SHAPResult.timestamp.desc()).first()
+        
+        if result:
+            data = json.loads(result.result_data)
+            # Sanitize loaded data (in case old data has issues)
+            data = _sanitize_for_json(data)
+            data['db_timestamp'] = result.timestamp.isoformat()
+            return data
+        return None
+    finally:
+        db.close()
+
+
+def check_shap_cached(filename: str) -> bool:
+    """
+    Check if SHAP analysis results are cached for a dataset.
+    
+    Args:
+        filename: Dataset filename
+    
+    Returns:
+        True if cached, False otherwise
+    """
+    db = get_db_session()
+    try:
+        count = db.query(SHAPResult).filter(
+            SHAPResult.filename == filename
+        ).count()
+        return count > 0
+    finally:
+        db.close()
+
+
+def delete_shap_result(filename: str) -> int:
+    """
+    Delete SHAP analysis result for a dataset.
+    
+    Args:
+        filename: Dataset filename
+    
+    Returns:
+        Number of records deleted
+    """
+    db = get_db_session()
+    try:
+        count = db.query(SHAPResult).filter(
+            SHAPResult.filename == filename
+        ).delete()
+        db.commit()
+        return count
+    finally:
+        db.close()
