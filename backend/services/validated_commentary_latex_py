@@ -1,0 +1,305 @@
+"""
+LaTeX Generator for Validated Commentary with Evidence Transparency.
+
+Generates publication-ready LaTeX sections presenting all evidence layers
+without pass/fail verdicts. Emphasizes transparency and informed decision-making.
+"""
+
+from typing import Dict, Any, List
+
+
+def _escape_latex(text: str) -> str:
+    """Escape special LaTeX characters."""
+    if not isinstance(text, str):
+        text = str(text)
+
+    text = text.replace('\\', r'\textbackslash{}')
+    replacements = {
+        '&': r'\&', '%': r'\%', '$': r'\$', '#': r'\#',
+        '_': r'\_', '{': r'\{', '}': r'\}', '~': r'\textasciitilde{}',
+        '^': r'\^{}', '<': r'\textless{}', '>': r'\textgreater{}',
+        '|': r'\textbar{}',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _format_metric(value: float, decimals: int = 4) -> str:
+    """Format metric value for LaTeX."""
+    if value is None:
+        return 'N/A'
+    return f"{value:.{decimals}f}"
+
+
+def generate_validated_commentary_section(commentary_data: Dict[str, Any]) -> str:
+    """
+    Generate LaTeX section for validated commentary.
+    Presents all evidence layers transparently for informed interpretation.
+
+    Args:
+        commentary_data: Dictionary containing all evidence layers
+
+    Returns:
+        Complete LaTeX section
+    """
+    if not commentary_data:
+        return ""
+
+    latex = []
+
+    # Section header
+    latex.append(r"\subsection{Validated Commentary: Evidence-Based Analysis}")
+    latex.append("")
+
+    # Introduction
+    latex.append(r"This section presents a comprehensive, evidence-based analysis combining ")
+    latex.append(r"statistical reliability evidence, explanatory validity checks, and AI-generated narrative. ")
+    latex.append(r"All evidence is presented transparently to support informed interpretation and decision-making.")
+    latex.append("")
+
+    # Overall Evidence Summary
+    if commentary_data.get('evidence_summary'):
+        latex.append(r"\textbf{Evidence Summary:} ")
+        latex.append(_escape_latex(commentary_data['evidence_summary']))
+        latex.append("")
+
+    # Layer 1: Statistical Reliability Evidence
+    statistical_evidence = commentary_data.get('statistical_evidence')
+    if statistical_evidence:
+        latex.extend(_generate_statistical_evidence_subsection(statistical_evidence))
+        latex.append("")
+
+    # Layer 2: Explanatory Validity Evidence
+    explanatory_evidence = commentary_data.get('explanatory_evidence')
+    if explanatory_evidence:
+        latex.extend(_generate_explanatory_evidence_subsection(explanatory_evidence))
+        latex.append("")
+
+    # Layer 3: AI-Generated Narrative
+    ai_narrative = commentary_data.get('ai_narrative')
+    if ai_narrative:
+        latex.extend(_generate_ai_narrative_subsection(ai_narrative))
+        latex.append("")
+
+    return "\n".join(latex)
+
+
+def _generate_statistical_evidence_subsection(statistical_evidence: Dict[str, Any]) -> List[str]:
+    """Generate subsection for statistical reliability evidence."""
+    latex = []
+
+    latex.append(r"\subsubsection{Layer 1: Statistical Reliability Evidence}")
+    latex.append("")
+
+    # Summary observations
+    observations = statistical_evidence.get('observations', [])
+    if observations:
+        latex.append(r"\textbf{Key Observations:}")
+        latex.append(r"\begin{itemize}")
+        for obs in observations:
+            latex.append(f"  \\item {_escape_latex(obs)}")
+        latex.append(r"\end{itemize}")
+        latex.append("")
+
+    # Statistical tests table
+    tests_conducted = statistical_evidence.get('tests_conducted', [])
+    if tests_conducted:
+        latex.append(r"\begin{table}[H]")
+        latex.append(r"\centering")
+        latex.append(r"\caption{Statistical Test Results}")
+        latex.append(r"\label{tab:validated_commentary_statistical_tests}")
+        latex.append(r"\begin{tabular}{llrr}")
+        latex.append(r"\toprule")
+        latex.append(r"\textbf{Test Name} & \textbf{Significance} & \textbf{p-value} & \textbf{Statistic} \\")
+        latex.append(r"\midrule")
+
+        for test in tests_conducted[:10]:  # Limit to 10 tests
+            test_name = _escape_latex(test.get('test_name', 'Unknown'))
+            significance = test.get('significance', 'N/A')
+            p_value = _format_metric(test.get('p_value'), 4)
+            statistic = _format_metric(test.get('statistic'), 4)
+
+            # Highlight significant tests
+            if significance == 'significant':
+                latex.append(f"\\textbf{{{test_name}}} & \\textbf{{{significance}}} & \\textbf{{{p_value}}} & {statistic} \\\\")
+            else:
+                latex.append(f"{test_name} & {significance} & {p_value} & {statistic} \\\\")
+
+        latex.append(r"\bottomrule")
+        latex.append(r"\end{tabular}")
+        latex.append(r"\end{table}")
+        latex.append("")
+
+    return latex
+
+
+def _generate_explanatory_evidence_subsection(explanatory_evidence: Dict[str, Any]) -> List[str]:
+    """Generate subsection for explanatory validity evidence."""
+    latex = []
+
+    latex.append(r"\subsubsection{Layer 2: Explanatory Validity Evidence}")
+    latex.append("")
+
+    # Summary observations
+    observations = explanatory_evidence.get('observations', [])
+    if observations:
+        latex.append(r"\textbf{Key Observations:}")
+        latex.append(r"\begin{itemize}")
+        for obs in observations:
+            latex.append(f"  \\item {_escape_latex(obs)}")
+        latex.append(r"\end{itemize}")
+        latex.append("")
+
+    # Evidence summary table
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Explanatory Validity Evidence Summary}")
+    latex.append(r"\label{tab:validated_commentary_explanatory_evidence}")
+    latex.append(r"\begin{tabular}{llp{8cm}}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Evidence Type} & \textbf{Result} & \textbf{Interpretation} \\")
+    latex.append(r"\midrule")
+
+    # Label Randomization
+    lr_data = explanatory_evidence.get('label_randomization')
+    if lr_data:
+        correlation = lr_data.get('correlation')
+        interpretation = _escape_latex(lr_data.get('interpretation', 'N/A'))
+
+        if correlation is not None:
+            corr_str = _format_metric(correlation, 3)
+            latex.append(f"Label Randomization & r = {corr_str} & {interpretation} \\\\")
+            latex.append(r"\midrule")
+
+    # Rank Stability
+    rank_stability = explanatory_evidence.get('rank_stability')
+    if rank_stability:
+        kendall_tau = rank_stability.get('kendall_tau')
+        interpretation = _escape_latex(rank_stability.get('interpretation', 'N/A'))
+
+        if kendall_tau is not None:
+            tau_str = _format_metric(kendall_tau, 3)
+            latex.append(f"Rank Stability & $\\tau$ = {tau_str} & {interpretation} \\\\")
+            latex.append(r"\midrule")
+
+    # Sanity Checks
+    sanity_checks = explanatory_evidence.get('sanity_checks', {})
+    checks_passed = sanity_checks.get('checks_passed', [])
+    if checks_passed:
+        passed_count = len(checks_passed)
+        checks_str = ', '.join([_escape_latex(c.replace('_', ' ').title()) for c in checks_passed[:3]])
+        latex.append(f"Sanity Checks & {passed_count} passed & {checks_str} \\\\")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    return latex
+
+
+def _generate_ai_narrative_subsection(ai_narrative: Dict[str, Any]) -> List[str]:
+    """Generate subsection for AI-generated narrative."""
+    latex = []
+
+    latex.append(r"\subsubsection{Layer 3: AI-Generated Narrative}")
+    latex.append("")
+
+    # Narrative text
+    narrative_text = ai_narrative.get('narrative', '')
+    if narrative_text:
+        # Escape and format narrative
+        escaped_narrative = _escape_latex(narrative_text)
+
+        # Replace newlines with LaTeX line breaks
+        formatted_narrative = escaped_narrative.replace('\n\n', '\n\n\\medskip\n\n')
+        formatted_narrative = formatted_narrative.replace('\n', ' ')
+
+        latex.append(formatted_narrative)
+        latex.append("")
+
+    # Evidence-based caveats
+    caveats = ai_narrative.get('caveats', [])
+    if caveats:
+        latex.append(r"\paragraph{Evidence-Based Caveats and Considerations:}")
+        latex.append(r"\begin{itemize}")
+        for caveat in caveats:
+            latex.append(f"  \\item {_escape_latex(caveat)}")
+        latex.append(r"\end{itemize}")
+        latex.append("")
+
+    # Confidence qualifiers
+    confidence_qualifiers = ai_narrative.get('confidence_qualifiers', [])
+    if confidence_qualifiers:
+        confidence = confidence_qualifiers[0] if confidence_qualifiers else 'moderate'
+        latex.append(f"\\textbf{{Overall Confidence Level:}} {_escape_latex(confidence.title())}")
+        latex.append("")
+
+    # Generation metadata
+    metadata = ai_narrative.get('generation_metadata', {})
+    if metadata:
+        latex.append(r"\begin{table}[H]")
+        latex.append(r"\centering")
+        latex.append(r"\caption{AI Narrative Generation Metadata}")
+        latex.append(r"\label{tab:validated_commentary_ai_metadata}")
+        latex.append(r"\begin{tabular}{ll}")
+        latex.append(r"\toprule")
+        latex.append(r"\textbf{Attribute} & \textbf{Value} \\")
+        latex.append(r"\midrule")
+
+        if metadata.get('model'):
+            latex.append(f"AI Model & {_escape_latex(metadata['model'])} \\\\")
+
+        if metadata.get('timestamp'):
+            latex.append(f"Generated & {_escape_latex(metadata['timestamp'][:19])} \\\\")
+
+        if metadata.get('evidence_layers_used'):
+            layers = ', '.join([_escape_latex(l.title()) for l in metadata['evidence_layers_used']])
+            latex.append(f"Evidence Layers & {layers} \\\\")
+
+        latex.append(r"\bottomrule")
+        latex.append(r"\end{tabular}")
+        latex.append(r"\end{table}")
+        latex.append("")
+
+    return latex
+
+
+def generate_multiple_commentaries_section(
+    commentaries: List[Dict[str, Any]],
+    dataset_filename: str
+) -> str:
+    """
+    Generate LaTeX section for multiple validated commentaries.
+
+    Args:
+        commentaries: List of commentary dictionaries
+        dataset_filename: Dataset name
+
+    Returns:
+        Complete LaTeX section
+    """
+    if not commentaries:
+        return ""
+
+    latex = []
+
+    latex.append(r"\section{Validated Commentaries}")
+    latex.append("")
+    latex.append(f"This section presents validated commentaries for all models trained on ")
+    latex.append(f"{_escape_latex(dataset_filename)}.")
+    latex.append("")
+
+    for i, commentary in enumerate(commentaries, 1):
+        model_name = commentary.get('model_name', f'Model {i}')
+
+        latex.append(f"\\subsection{{{_escape_latex(model_name)}}}")
+        latex.append("")
+
+        # Generate individual commentary section
+        commentary_section = generate_validated_commentary_section(commentary)
+        latex.append(commentary_section)
+        latex.append("")
+
+    return "\n".join(latex)

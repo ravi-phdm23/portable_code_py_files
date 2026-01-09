@@ -1,0 +1,421 @@
+"""
+PyTorch-based classifier wrappers compatible with scikit-learn API.
+
+These classifiers implement fit/predict/predict_proba methods to work
+seamlessly with sklearn pipelines and the model registry.
+"""
+
+import numpy as np
+from sklearn.base import BaseEstimator, ClassifierMixin
+
+# Check if PyTorch is available
+TORCH_AVAILABLE = False
+TORCH_IMPORT_ERROR = None
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import TensorDataset, DataLoader
+    TORCH_AVAILABLE = True
+except (ImportError, OSError, Exception) as e:
+    # PyTorch not available or failed to load (DLL errors, etc.)
+    # This is fine - PyTorch models will simply not be registered
+    TORCH_IMPORT_ERROR = f"{type(e).__name__}: {str(e)}"
+    import sys
+    print(f"[torch_models] PyTorch not available: {TORCH_IMPORT_ERROR}", file=sys.stderr)
+
+
+if TORCH_AVAILABLE:
+    # ==================== MLP Network ====================
+    class MLPNetwork(nn.Module):
+        """Multi-Layer Perceptron with configurable hidden layers and dropout."""
+
+        def __init__(self, input_dim, hidden_dims=(64, 32), dropout=0.1, n_classes=2):
+            super().__init__()
+            layers = []
+            prev_dim = input_dim
+
+            for hidden_dim in hidden_dims:
+                layers.append(nn.Linear(prev_dim, hidden_dim))
+                layers.append(nn.ReLU())
+                if dropout > 0:
+                    layers.append(nn.Dropout(dropout))
+                prev_dim = hidden_dim
+
+            layers.append(nn.Linear(prev_dim, n_classes))
+            self.network = nn.Sequential(*layers)
+
+        def forward(self, x):
+            return self.network(x)
+
+
+    # ==================== TCN Network ====================
+    class TemporalBlock(nn.Module):
+        """Temporal convolutional block with residual connection."""
+
+        def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout):
+            super().__init__()
+            # Use causal padding (padding on left side only)
+            self.padding = (kernel_size - 1) * dilation
+            self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size,
+                                   padding=0, dilation=dilation)
+            self.relu1 = nn.ReLU()
+            self.dropout1 = nn.Dropout(dropout)
+
+            self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size,
+                                   padding=0, dilation=dilation)
+            self.relu2 = nn.ReLU()
+            self.dropout2 = nn.Dropout(dropout)
+
+            self.downsample = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else None
+            self.relu = nn.ReLU()
+
+        def forward(self, x):
+            # Apply causal padding manually
+            out = torch.nn.functional.pad(x, (self.padding, 0))
+            out = self.conv1(out)
+            out = self.relu1(out)
+            out = self.dropout1(out)
+
+            out = torch.nn.functional.pad(out, (self.padding, 0))
+            out = self.conv2(out)
+            out = self.relu2(out)
+            out = self.dropout2(out)
+
+            res = x if self.downsample is None else self.downsample(x)
+            return self.relu(out + res)
+
+
+    class TCNNetwork(nn.Module):
+        """Temporal Convolutional Network."""
+
+        def __init__(self, input_dim, seq_len, channels=(64, 64, 64), kernel_size=3, dropout=0.1, n_classes=2):
+            super().__init__()
+            layers = []
+            num_levels = len(channels)
+
+            for i in range(num_levels):
+                in_channels = input_dim if i == 0 else channels[i-1]
+                out_channels = channels[i]
+                dilation = 2 ** i
+                layers.append(TemporalBlock(in_channels, out_channels, kernel_size, dilation, dropout))
+
+            self.network = nn.Sequential(*layers)
+            self.fc = nn.Linear(channels[-1] * seq_len, n_classes)
+
+        def forward(self, x):
+            # x shape: (batch, seq_len, features)
+            x = x.transpose(1, 2)  # (batch, features, seq_len)
+            out = self.network(x)
+            out = out.reshape(out.size(0), -1)
+            return self.fc(out)
+
+
+    # ==================== Transformer Network ====================
+    class TransformerEncoderNetwork(nn.Module):
+        """Transformer Encoder for classification."""
+
+        def __init__(self, input_dim, seq_len, d_model=64, nhead=4, num_layers=2,
+                     dim_feedforward=128, dropout=0.1, n_classes=2):
+            super().__init__()
+            self.embedding = nn.Linear(input_dim, d_model)
+            self.pos_encoding = nn.Parameter(torch.randn(1, seq_len, d_model))
+
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.fc = nn.Linear(d_model * seq_len, n_classes)
+
+        def forward(self, x):
+            # x shape: (batch, seq_len, features)
+            x = self.embedding(x)
+            x = x + self.pos_encoding
+            x = self.transformer(x)
+            x = x.reshape(x.size(0), -1)
+            return self.fc(x)
+
+
+    # ==================== Sklearn-compatible Wrappers ====================
+    class TorchMLPClassifier(BaseEstimator, ClassifierMixin):
+        """MLP classifier compatible with sklearn API."""
+
+        def __init__(self, hidden_dims=(64, 32), dropout=0.1, lr=1e-3, batch_size=256,
+                     max_epochs=50, patience=5, verbose=False, random_state=42):
+            self.hidden_dims = hidden_dims
+            self.dropout = dropout
+            self.lr = lr
+            self.batch_size = batch_size
+            self.max_epochs = max_epochs
+            self.patience = patience
+            self.verbose = verbose
+            self.random_state = random_state
+            self.model_ = None
+            self.classes_ = None
+            self.n_classes_ = None
+
+        def fit(self, X, y):
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
+
+            self.classes_ = np.unique(y)
+            self.n_classes_ = len(self.classes_)
+
+            # Convert to numpy arrays if needed
+            X_array = np.asarray(X, dtype=np.float32)
+            y_array = np.asarray(y, dtype=np.int64)
+
+            X_tensor = torch.FloatTensor(X_array)
+            y_tensor = torch.LongTensor(y_array)
+            dataset = TensorDataset(X_tensor, y_tensor)
+            loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+            self.model_ = MLPNetwork(X_array.shape[1], self.hidden_dims, self.dropout, self.n_classes_)
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(self.model_.parameters(), lr=self.lr)
+
+            best_loss = float('inf')
+            patience_counter = 0
+
+            for epoch in range(self.max_epochs):
+                self.model_.train()
+                total_loss = 0
+                for X_batch, y_batch in loader:
+                    optimizer.zero_grad()
+                    outputs = self.model_(X_batch)
+                    loss = criterion(outputs, y_batch)
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+
+                avg_loss = total_loss / len(loader)
+                if self.verbose:
+                    print(f"Epoch {epoch+1}/{self.max_epochs}, Loss: {avg_loss:.4f}")
+
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.patience:
+                        if self.verbose:
+                            print(f"Early stopping at epoch {epoch+1}")
+                        break
+
+            return self
+
+        def predict_proba(self, X):
+            self.model_.eval()
+            with torch.no_grad():
+                # Convert to numpy array if needed
+                X_array = np.asarray(X, dtype=np.float32)
+                X_tensor = torch.FloatTensor(X_array)
+                logits = self.model_(X_tensor)
+                probs = torch.softmax(logits, dim=1).numpy()
+            return probs
+
+        def predict(self, X):
+            probs = self.predict_proba(X)
+            return self.classes_[np.argmax(probs, axis=1)]
+
+
+    class TorchTCNClassifier(BaseEstimator, ClassifierMixin):
+        """TCN classifier compatible with sklearn API."""
+
+        def __init__(self, seq_len=1, channels=(64, 64, 64), kernel_size=3, dropout=0.1,
+                     lr=1e-3, batch_size=128, max_epochs=50, patience=5, verbose=False, random_state=42):
+            self.seq_len = seq_len
+            self.channels = channels
+            self.kernel_size = kernel_size
+            self.dropout = dropout
+            self.lr = lr
+            self.batch_size = batch_size
+            self.max_epochs = max_epochs
+            self.patience = patience
+            self.verbose = verbose
+            self.random_state = random_state
+            self.model_ = None
+            self.classes_ = None
+            self.n_classes_ = None
+
+        def fit(self, X, y):
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
+
+            self.classes_ = np.unique(y)
+            self.n_classes_ = len(self.classes_)
+
+            # Convert to numpy arrays if needed
+            X_array = np.asarray(X, dtype=np.float32)
+            y_array = np.asarray(y, dtype=np.int64)
+
+            # Reshape to (batch, seq_len, features)
+            X_reshaped = X_array.reshape(-1, self.seq_len, X_array.shape[1] // self.seq_len) if X_array.shape[1] % self.seq_len == 0 else X_array.reshape(-1, self.seq_len, X_array.shape[1])
+
+            X_tensor = torch.FloatTensor(X_reshaped)
+            y_tensor = torch.LongTensor(y_array)
+            dataset = TensorDataset(X_tensor, y_tensor)
+            loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+            input_dim = X_reshaped.shape[2]
+            self.model_ = TCNNetwork(input_dim, self.seq_len, self.channels, self.kernel_size, self.dropout, self.n_classes_)
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(self.model_.parameters(), lr=self.lr)
+
+            best_loss = float('inf')
+            patience_counter = 0
+
+            for epoch in range(self.max_epochs):
+                self.model_.train()
+                total_loss = 0
+                for X_batch, y_batch in loader:
+                    optimizer.zero_grad()
+                    outputs = self.model_(X_batch)
+                    loss = criterion(outputs, y_batch)
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+
+                avg_loss = total_loss / len(loader)
+                if self.verbose:
+                    print(f"Epoch {epoch+1}/{self.max_epochs}, Loss: {avg_loss:.4f}")
+
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.patience:
+                        if self.verbose:
+                            print(f"Early stopping at epoch {epoch+1}")
+                        break
+
+            return self
+
+        def predict_proba(self, X):
+            self.model_.eval()
+            # Convert to numpy array if needed
+            X_array = np.asarray(X, dtype=np.float32)
+            X_reshaped = X_array.reshape(-1, self.seq_len, X_array.shape[1] // self.seq_len) if X_array.shape[1] % self.seq_len == 0 else X_array.reshape(-1, self.seq_len, X_array.shape[1])
+            with torch.no_grad():
+                X_tensor = torch.FloatTensor(X_reshaped)
+                logits = self.model_(X_tensor)
+                probs = torch.softmax(logits, dim=1).numpy()
+            return probs
+
+        def predict(self, X):
+            probs = self.predict_proba(X)
+            return self.classes_[np.argmax(probs, axis=1)]
+
+
+    class TorchTransformerEncoderClassifier(BaseEstimator, ClassifierMixin):
+        """Transformer Encoder classifier compatible with sklearn API."""
+
+        def __init__(self, seq_len=1, d_model=64, nhead=4, num_layers=2, dim_feedforward=128,
+                     dropout=0.1, lr=1e-3, batch_size=128, max_epochs=50, patience=5,
+                     verbose=False, random_state=42):
+            self.seq_len = seq_len
+            self.d_model = d_model
+            self.nhead = nhead
+            self.num_layers = num_layers
+            self.dim_feedforward = dim_feedforward
+            self.dropout = dropout
+            self.lr = lr
+            self.batch_size = batch_size
+            self.max_epochs = max_epochs
+            self.patience = patience
+            self.verbose = verbose
+            self.random_state = random_state
+            self.model_ = None
+            self.classes_ = None
+            self.n_classes_ = None
+
+        def fit(self, X, y):
+            torch.manual_seed(self.random_state)
+            np.random.seed(self.random_state)
+
+            self.classes_ = np.unique(y)
+            self.n_classes_ = len(self.classes_)
+
+            # Convert to numpy arrays if needed
+            X_array = np.asarray(X, dtype=np.float32)
+            y_array = np.asarray(y, dtype=np.int64)
+
+            # Reshape to (batch, seq_len, features)
+            X_reshaped = X_array.reshape(-1, self.seq_len, X_array.shape[1] // self.seq_len) if X_array.shape[1] % self.seq_len == 0 else X_array.reshape(-1, self.seq_len, X_array.shape[1])
+
+            X_tensor = torch.FloatTensor(X_reshaped)
+            y_tensor = torch.LongTensor(y_array)
+            dataset = TensorDataset(X_tensor, y_tensor)
+            loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+            input_dim = X_reshaped.shape[2]
+            self.model_ = TransformerEncoderNetwork(
+                input_dim, self.seq_len, self.d_model, self.nhead,
+                self.num_layers, self.dim_feedforward, self.dropout, self.n_classes_
+            )
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(self.model_.parameters(), lr=self.lr)
+
+            best_loss = float('inf')
+            patience_counter = 0
+
+            for epoch in range(self.max_epochs):
+                self.model_.train()
+                total_loss = 0
+                for X_batch, y_batch in loader:
+                    optimizer.zero_grad()
+                    outputs = self.model_(X_batch)
+                    loss = criterion(outputs, y_batch)
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+
+                avg_loss = total_loss / len(loader)
+                if self.verbose:
+                    print(f"Epoch {epoch+1}/{self.max_epochs}, Loss: {avg_loss:.4f}")
+
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.patience:
+                        if self.verbose:
+                            print(f"Early stopping at epoch {epoch+1}")
+                        break
+
+            return self
+
+        def predict_proba(self, X):
+            self.model_.eval()
+            # Convert to numpy array if needed
+            X_array = np.asarray(X, dtype=np.float32)
+            X_reshaped = X_array.reshape(-1, self.seq_len, X_array.shape[1] // self.seq_len) if X_array.shape[1] % self.seq_len == 0 else X_array.reshape(-1, self.seq_len, X_array.shape[1])
+            with torch.no_grad():
+                X_tensor = torch.FloatTensor(X_reshaped)
+                logits = self.model_(X_tensor)
+                probs = torch.softmax(logits, dim=1).numpy()
+            return probs
+
+        def predict(self, X):
+            probs = self.predict_proba(X)
+            return self.classes_[np.argmax(probs, axis=1)]
+
+else:
+    # Dummy classes when PyTorch is not available
+    class TorchMLPClassifier:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PyTorch is not installed. Please install torch to use PyTorch models.")
+
+    class TorchTCNClassifier:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PyTorch is not installed. Please install torch to use PyTorch models.")
+
+    class TorchTransformerEncoderClassifier:
+        def __init__(self, *args, **kwargs):
+            raise ImportError("PyTorch is not installed. Please install torch to use PyTorch models.")

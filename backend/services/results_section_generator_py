@@ -1,0 +1,1454 @@
+"""
+Publication-Grade LaTeX Results Section Generator.
+
+Generates complete, exhaustive Results sections from all database artifacts.
+No filtering, no summarization - all available data is presented.
+
+Scope: Assembles all stored artifacts (tables, figures, metrics) into
+a journal-submission-ready Results section.
+"""
+
+import json
+import os
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+import logging
+from typing import List, Dict, Any, Optional
+
+#Helper functions for LaTeX generation
+def _escape_latex(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.replace('\\', '\\textbackslash{}')
+    replacements = {
+        '&': '\\&',
+        '%': '\\%',
+        '$': '\\$',
+        '#': '\\#',
+        '_': '\\_',
+        '{': '\\{',
+        '}': '\\}',
+        '~': '\\textasciitilde{}',
+        '^': '\\^{}',
+        '<': '\\textless{}',
+        '>': '\\textgreater{}',
+        '|': '\\textbar{}',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _format_metric(value: Any, decimals: int = 4) -> str:
+    if value is None:
+        return '—'
+    try:
+        return f"{float(value):.{decimals}f}"
+    except Exception:
+        return str(value)
+
+
+def _generate_evaluation_metrics_table() -> str:
+    """
+    Generate static evaluation metrics summary table.
+    This table describes all metrics used in the analysis.
+    """
+    latex = []
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Summary of evaluation metrics used for benchmarking and performance assessment.}")
+    latex.append(r"\label{tab:evaluation_metrics_full}")
+    latex.append(r"\setlength{\tabcolsep}{6pt}")
+    latex.append(r"\renewcommand{\arraystretch}{1.3}")
+    latex.append(r"\resizebox{\textwidth}{!}{%")
+    latex.append(r"\begin{tabular}{")
+    latex.append(r"  >{\raggedright\arraybackslash}p{4.0cm}")
+    latex.append(r"  >{\raggedright\arraybackslash}p{5.0cm}")
+    latex.append(r"  >{\centering\arraybackslash}p{5.5cm}")
+    latex.append(r"}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Metric (Full Form)} & \textbf{Usage} & \textbf{Formula} \\")
+    latex.append(r"\midrule")
+    latex.append("")
+    latex.append(r"AUC -- Area Under ROC Curve &")
+    latex.append(r"Ranking ability; sensitivity to score ordering &")
+    latex.append(r"$\displaystyle \mathrm{AUC} = \int_0^1 \mathrm{TPR}(x)\, d(\mathrm{FPR}(x))$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"PCC -- Prevalence Corrected Classification &")
+    latex.append(r"Accuracy adjusted for empirical class prevalence &")
+    latex.append(r"$\displaystyle \mathrm{PCC} =")
+    latex.append(r"\frac{\mathrm{TP} + \mathrm{TN}}")
+    latex.append(r"     {\mathrm{TP} + \mathrm{FP} + \mathrm{TN} + \mathrm{FN}}$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"F1 -- F1 Score &")
+    latex.append(r"Balances precision and recall; useful under class imbalance &")
+    latex.append(r"$\displaystyle F1 =")
+    latex.append(r"\frac{2 \times \mathrm{Precision} \times \mathrm{Recall}}")
+    latex.append(r"     {\mathrm{Precision} + \mathrm{Recall}}$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"Recall -- Sensitivity &")
+    latex.append(r"Ability to detect defaults (true positives) &")
+    latex.append(r"$\displaystyle \mathrm{Recall} =")
+    latex.append(r"\frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FN}}$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"BS -- Brier Score &")
+    latex.append(r"Measures probability calibration error &")
+    latex.append(r"$\displaystyle \mathrm{BS} =")
+    latex.append(r"\frac{1}{N} \sum_{i=1}^N (p_i - y_i)^2$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"KS -- Kolmogorov--Smirnov Statistic &")
+    latex.append(r"Maximum class separation between default and non-default distributions &")
+    latex.append(r"$\displaystyle \max_{t} \left|\mathrm{TPR}(t) - \mathrm{FPR}(t)\right|$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"PG -- Partial Gini &")
+    latex.append(r"Local discrimination in conservative decision regions &")
+    latex.append(r"$\displaystyle \mathrm{PG} = 2 \times \mathrm{AUC}_{(p \le b)} - 1$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"H -- Hand's H-measure &")
+    latex.append(r"Utility-based, cost-sensitive alternative to AUC &")
+    latex.append(r"$\displaystyle H = 1 - \frac{\mathrm{EMC}}{\mathrm{EMC}_0}$ \\")
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"}")
+    latex.append(r"\end{table}")
+    latex.append("")
+    return "\n".join(latex)
+
+
+def _build_feature_importance_section(
+    fi_results: Dict[str, Any],
+    image_paths: Dict[str, str]
+) -> str:
+    """Build Feature Importance Analysis section with consistent table sizing."""
+    latex = []
+
+    if not fi_results:
+        return ""
+
+
+    merged_table = fi_results.get("merged_table", [])
+    if not merged_table:
+        return "\n".join(latex)
+
+    # latex.append(r"\textbf{Top features by combined RF/LR importance}")
+    # latex.append(r"\bigskip")
+    # latex.append("")
+
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Top features by combined RF/LR importance}")
+    latex.append(r"\label{tab:fi_combined}")
+    latex.append(r"\footnotesize")
+    latex.append(r"\begin{tabular}{c p{6.0cm} c c c}")
+    latex.append(r"\toprule")
+    latex.append(r"Rank & Feature & RF Imp. & LR [Coef] & Avg. \\")
+    latex.append(r"\midrule")
+
+    for idx, item in enumerate(merged_table[:20], 1):
+        feature = _escape_latex(item.get("base_feature", "N/A"))
+        rf_imp = _format_metric(item.get("rf_score_norm", item.get("rf_imp", 0)), 3)
+        lr_coef = _format_metric(item.get("lr_score_norm", item.get("lr_coef", 0)), 3)
+        avg = item.get("average", item.get("avg_score", item.get("consensus_rank", 0)))
+        avg_str = _format_metric(avg, 3)
+
+        latex.append(f"{idx} & {feature} & {rf_imp} & {lr_coef} & {avg_str} \\\\")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    return "\n".join(latex)
+
+
+def _smote_distribution_table(smote_results: Dict[str, Any]) -> str:
+    orig = smote_results["original_distribution"]
+    res = smote_results["resampled_distribution"]
+
+    orig_total = sum(orig.values())
+    res_total = sum(res.values())
+
+    latex = []
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{SMOTE Class Distribution Comparison}")
+    latex.append(r"\label{tab:smote_class_distribution}")
+    latex.append(r"\footnotesize")
+    latex.append(r"\begin{tabular}{c c c c c}")
+    latex.append(r"\toprule")
+    latex.append(r"Class & Orig. Cnt. & SMOTE Cnt. & Orig. \% & SMOTE \% \\")
+    latex.append(r"\midrule")
+
+    for cls in sorted(orig.keys()):
+        o_cnt = orig[cls]
+        s_cnt = res.get(cls, 0)
+        o_pct = round(100 * o_cnt / orig_total)
+        s_pct = round(100 * s_cnt / res_total)
+
+        try:
+            cls_display = str(int(float(cls)))
+        except Exception:
+            cls_display = cls
+
+        latex.append(
+            f"{cls_display} & {o_cnt} & {s_cnt} & {o_pct} & {s_pct} \\\\"
+        )
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+
+    return "\n".join(latex)
+
+
+def _build_model_performance_section(run_data: Dict[str, Any]) -> str:
+    """Build grouped Model Performance table with consistent sizing."""
+
+    all_models = run_data.get("all_models", [])
+    dataset_name = run_data.get("dataset_name", "dataset")
+
+    if not all_models:
+        return ""
+
+    latex = []
+
+    grouped = {}
+    for m in all_models:
+        grouped.setdefault(m.get("model_group", "Ungrouped"), []).append(m)
+
+    latex.append(r"\begin{table}[H]")
+    latex.append(
+        rf"\caption{{Comprehensive Model Performance Results — {_escape_latex(dataset_name)}}}"
+    )
+    latex.append(
+        rf"\label{{tab:all_models_{dataset_name.replace('.', '_')}}}"
+    )
+    latex.append(r"\centering")
+    latex.append(r"\footnotesize")
+    latex.append(r"\begin{adjustbox}{max width=\textwidth}")
+    latex.append(r"\begin{tabular}{l p{5.0cm} c c c c c c c c}")
+    latex.append(r"\toprule")
+    latex.append(r"Group & Model & AUC & PCC & F1 & Rec. & BS & KS & PG & H \\")
+    latex.append(r"\midrule")
+
+    for g_idx, group in enumerate(grouped):
+        for idx, model in enumerate(grouped[group]):
+            metrics = model.get("metrics", {})
+            is_best = model.get("is_best_in_group", False)
+
+            group_cell = _escape_latex(group) if idx == 0 else ""
+            model_cell = _escape_latex(model.get("model_name", "Unknown"))
+
+            def fmt(v):
+                return _format_metric(v, 3)
+
+            values = [
+                fmt(metrics.get("AUC")),
+                fmt(metrics.get("PCC")),
+                fmt(metrics.get("F1")),
+                fmt(metrics.get("Recall")),
+                fmt(metrics.get("BS")),
+                fmt(metrics.get("KS")),
+                fmt(metrics.get("PG")),
+                fmt(metrics.get("H")),
+            ]
+
+            if is_best:
+                model_cell = rf"\textbf{{{model_cell}}}"
+                values = [rf"\textbf{{{v}}}" for v in values]
+
+            latex.append(
+                f"{group_cell} & {model_cell} & "
+                + " & ".join(values)
+                + r" \\"
+            )
+
+        if g_idx < len(grouped) - 1:
+            latex.append(r"\midrule")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{adjustbox}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    return "\n".join(latex)
+
+
+def _build_benchmark_section(run_data: Dict[str, Any]) -> str:
+    """Build Benchmark section with consistent table geometry."""
+
+    benchmarks = run_data.get("benchmark_model")
+    if not benchmarks:
+        return ""
+
+    latex = []
+
+    def score_key(row):
+        m = row.get("metrics", {})
+        return (m.get("AUC", float("-inf")), -m.get("BS", float("inf")))
+
+    overall_best = max(benchmarks, key=score_key)
+
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Benchmark Results}")
+    latex.append(r"\label{tab:benchmark}")
+    latex.append(r"\footnotesize")
+    latex.append(r"\begin{adjustbox}{max width=\textwidth}")
+    latex.append(r"\begin{tabular}{l p{5.0cm} c c c c c c c c}")
+    latex.append(r"\toprule")
+    latex.append(r"Group & Model & AUC & PCC & F1 & Rec. & BS & KS & PG & H \\")
+    latex.append(r"\midrule")
+
+    for row in benchmarks:
+        metrics = row.get("metrics", {})
+        group = _escape_latex(row.get("model_group", "N/A"))
+        model = _escape_latex(row.get("model_name", "N/A"))
+
+        def fmt(v):
+            return _format_metric(v, 3)
+
+        values = [
+            fmt(metrics.get("AUC")),
+            fmt(metrics.get("PCC")),
+            fmt(metrics.get("F1")),
+            fmt(metrics.get("Recall")),
+            fmt(metrics.get("BS")),
+            fmt(metrics.get("KS")),
+            fmt(metrics.get("PG")),
+            fmt(metrics.get("H")),
+        ]
+
+        if row is overall_best:
+            group = rf"\textbf{{{group}}}"
+            model = rf"\textbf{{{model}}}"
+            values = [rf"\textbf{{{v}}}" for v in values]
+
+        latex.append(
+            f"{group} & {model} & "
+            + " & ".join(values)
+            + r" \\"
+        )
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{adjustbox}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    # Add performance trend analysis figure after benchmark table
+    # Using unified B&W-optimized chart for publication-ready output
+    from services.performance_trend_latex import generate_unified_performance_profile
+    trend_figure = generate_unified_performance_profile(benchmarks)
+    if trend_figure:
+        latex.append(trend_figure)
+        latex.append("")
+
+    return "\n".join(latex)
+
+
+# def generate_flexible_latex_table(
+#     data: List[Dict[str, Any]],
+#     caption: str,
+#     label: str,
+#     column_order: Optional[List[str]] = None,
+#     column_labels: Optional[Dict[str, str]] = None,
+#     column_formats: Optional[Dict[str, str]] = None,
+#     max_rows: Optional[int] = None,
+#     size: str = 'tiny',
+#     notes: Optional[str] = None
+# ) -> str:
+#     """
+#     Generate a flexible LaTeX table with customizable formatting.
+
+#     Args:
+#         data: List of dictionaries (each dict is a row)
+#         caption: Table caption
+#         label: LaTeX label for referencing
+#         column_order: Order of columns (if None, uses dict key order)
+#         column_labels: Custom column headers {key: label}
+#         column_formats: Format specs per column {key: 'format'}
+#         max_rows: Maximum rows to display
+#         size: Table size ('tiny', 'footnotesize', 'small', None)
+#         notes: Additional notes/footnotes to add below table
+
+#     Returns:
+#         LaTeX table string
+#     """
+#     if not data:
+#         return ""
+
+#     latex = []
+
+#     # Determine columns
+#     if column_order:
+#         columns = column_order
+#     else:
+#         columns = []
+#         for row in data:
+#             for key in row.keys():
+#                 if key not in columns:
+#                     columns.append(key)
+
+#     # Apply max_rows limit
+#     display_data = data[:max_rows] if max_rows else data
+
+#     # Start table
+#     latex.append(r"\begin{table}[H]")
+#     latex.append(r"\centering")
+#     latex.append(f"\\caption{{{_escape_latex(caption)}}}")
+#     latex.append(f"\\label{{{label}}}")
+
+#     # Size wrapper
+#     use_adjustbox = len(columns) > 6 or size == 'tiny'
+#     if use_adjustbox:
+#         latex.append(r"\begin{adjustbox}{width=\textwidth}")
+#         if size:
+#             latex.append(f"{{\\{size}")
+#     elif size:
+#         latex.append(f"\\{size}")
+
+#     # Column specification
+#     col_spec = "c " * len(columns)
+#     latex.append(f"\\begin{{tabular}}{{{col_spec.strip()}}}")
+#     latex.append(r"\toprule")
+
+#     # Header row
+#     headers = []
+#     for col in columns:
+#         if column_labels and col in column_labels:
+#             headers.append(_escape_latex(column_labels[col]))
+#         else:
+#             headers.append(_escape_latex(str(col)))
+#     latex.append(" & ".join(headers) + " \\\\")
+#     latex.append(r"\midrule")
+
+#     # Data rows
+#     for row in display_data:
+#         cells = []
+#         for col in columns:
+#             value = row.get(col, '')
+
+#             # Apply custom formatting if specified
+#             if column_formats and col in column_formats:
+#                 fmt = column_formats[col]
+#                 if fmt == 'int':
+#                     cells.append(str(int(value)) if value not in ['', None] else '—')
+#                 elif fmt == 'pct':
+#                     cells.append(f"{float(value):.0f}" if value not in ['', None] else '—')
+#                 elif fmt.startswith('decimal'):
+#                     decimals = int(fmt.split(':')[1]) if ':' in fmt else 3
+#                     cells.append(_format_metric(value, decimals=decimals))
+#                 else:
+#                     cells.append(_escape_latex(str(value)))
+#             elif isinstance(value, (int, float)):
+#                 cells.append(_format_metric(value))
+#             else:
+#                 cells.append(_escape_latex(str(value)))
+
+#         latex.append(" & ".join(cells) + " \\\\")
+
+#     # Close table
+#     latex.append(r"\bottomrule")
+#     latex.append(r"\end{tabular}")
+
+#     if use_adjustbox:
+#         if size:
+#             latex.append(r"}")
+#         latex.append(r"\end{adjustbox}")
+
+#     latex.append(r"\end{table}")
+
+#     # Add notes if provided
+#     if notes:
+#         latex.append("")
+#         latex.append(f"\\noindent\\textit{{{_escape_latex(notes)}}}")
+
+#     latex.append("")
+
+#     return "\n".join(latex)
+
+
+# def generate_latex_table_from_records(
+#     records: List[Dict[str, Any]],
+#     caption: str,
+#     label: str,
+#     max_rows: Optional[int] = 50,
+#     tiny: bool = True
+# ) -> str:
+#     """
+#     Render a list-of-dicts as a consistent LaTeX table.
+
+#     - `records` should be a list of dicts (each dict is a row).
+#     - Columns are determined by the union of keys in all records,
+#       preserving insertion order where possible.
+#     """
+#     if not records:
+#         return ""
+
+#     latex = []
+
+#     # --------------------------------------------------
+#     # Build column list (stable order, union of keys)
+#     # --------------------------------------------------
+#     cols = []
+#     for r in records:
+#         for k in r.keys():
+#             if k not in cols:
+#                 cols.append(k)
+
+#     # Limit rows if requested
+#     display_rows = records if max_rows is None else records[:max_rows]
+
+#     # --------------------------------------------------
+#     # Table header
+#     # --------------------------------------------------
+#     latex.append(r"\begin{table}[H]")
+#     latex.append(r"\centering")
+#     latex.append(f"\\caption{{{_escape_latex(caption)}}}")
+#     latex.append(f"\\label{{{_escape_latex(label)}}}")
+
+#     if tiny:
+#         latex.append(r"\begin{adjustbox}{width=\textwidth}")
+#         latex.append(r"{\tiny")
+
+#     col_spec = "l" + (" c" * (len(cols) - 1))
+#     latex.append(f"\\begin{{tabular}}{{{col_spec}}}")
+#     latex.append(r"\toprule")
+
+#     # Header row
+#     header = " & ".join(_escape_latex(str(c)) for c in cols) + r" \\"
+#     latex.append(header)
+#     latex.append(r"\midrule")
+
+#     # --------------------------------------------------
+#     # Rows (FIXED: one LaTeX row per record)
+#     # --------------------------------------------------
+#     for row in display_rows:
+#         cells = []
+#         for c in cols:
+#             v = row.get(c, "")
+#             if isinstance(v, (int, float)):
+#                 cells.append(_format_metric(v))
+#             else:
+#                 cells.append(_escape_latex(str(v)))
+#         latex.append(" & ".join(cells) + r" \\")
+
+#     # --------------------------------------------------
+#     # Footer
+#     # --------------------------------------------------
+#     latex.append(r"\bottomrule")
+#     latex.append(r"\end{tabular}")
+
+#     if tiny:
+#         latex.append(r"}")
+#         latex.append(r"\end{adjustbox}")
+
+#     latex.append(r"\end{table}")
+#     latex.append("")
+
+#     return "\n".join(latex)
+
+
+# def _get_relative_image_path(full_path: str) -> str:
+#     """Convert full image path to relative path for LaTeX inclusion."""
+#     if not full_path:
+#         return ""
+#     # Return path relative to backend directory
+#     return full_path.replace("\\", "/")
+
+
+# def _build_dataset_overview_section(dataset_metadata: Dict[str, Any],
+#                                      pandas_results: Dict[str, Any]) -> str:
+#     """Build Dataset Overview section with all metadata and statistics."""
+#     latex = []
+
+#     latex.append(r"\section*{Results}")
+#     latex.append("")
+#     latex.append(r"\textbf{Dataset Overview}")
+#     latex.append(r"\midskip")
+#     latex.append("")
+
+#     # Dataset metadata table
+#     latex.append(r"\begin{table}[H]")
+#     latex.append(r"\centering")
+#     latex.append(r"\caption{Dataset Characteristics}")
+#     latex.append(r"\label{tab:dataset_metadata}")
+#     latex.append(r"\begin{tabular}{l r}")
+#     latex.append(r"\toprule")
+#     latex.append(r"Characteristic & Value \\")
+#     latex.append(r"\midrule")
+
+#     latex.append(f"Dataset & {_escape_latex(dataset_metadata.get('filename', 'N/A'))} \\\\")
+#     latex.append(f"Total Samples & {dataset_metadata.get('total_rows', 'N/A')} \\\\")
+#     latex.append(f"Total Features & {dataset_metadata.get('total_columns', 'N/A')} \\\\")
+#     latex.append(f"Target Column & {_escape_latex(dataset_metadata.get('target_column', 'N/A'))} \\\\")
+
+#     latex.append(r"\bottomrule")
+#     latex.append(r"\end{tabular}")
+#     latex.append(r"\end{table}")
+#     latex.append("")
+
+#     # Describe statistics table (if available)
+#     describe_stats = pandas_results.get('describe', {})
+#     if describe_stats:
+#         latex.append(r"\textbf{Summary Statistics}")
+#         latex.append(r"\bigskip")
+#         latex.append("")
+
+#         # Build descriptive statistics table (Table 2 style)
+#         stats_df = describe_stats  # Assuming it's dict of {column: {stat: value}}
+#         if isinstance(stats_df, dict):
+#             # Get all columns
+#             columns = list(stats_df.keys())
+
+#             # Use abbreviated column names in header if they exist
+#             col_headers = []
+#             for col in columns:
+#                 # Try to get abbreviated name, otherwise use first few chars
+#                 abbrev = col[:4] if len(col) > 4 else col
+#                 col_headers.append(abbrev)
+
+#             latex.append(r"\begin{table}[H]")
+#             latex.append(r"\centering")
+#             latex.append(r"\caption{Summary statistics}")
+#             latex.append(r"\label{tab:summary_stats}")
+
+#             # Use adjustbox for wide tables
+#             if len(columns) > 5:
+#                 latex.append(r"\begin{adjustbox}{width=\textwidth}")
+#                 latex.append(r"{\tiny")
+#             else:
+#                 latex.append(r"\footnotesize")
+
+#             # Build column specification
+#             col_spec = "l" + (" c" * len(columns))
+#             latex.append(f"\\begin{{tabular}}{{{col_spec}}}")
+#             latex.append(r"\toprule")
+
+#             # Header row with abbreviated names
+#             header = " & ".join([_escape_latex(str(h)) for h in col_headers]) + " \\\\"
+#             latex.append(header)
+#             latex.append(r"\midrule")
+
+#             # Stats rows (count, mean, std, min, 25%, 50%, 75%, max)
+#             stats_display = {
+#                 'count': 'count',
+#                 'mean': 'mean',
+#                 'std': 'std',
+#                 'min': 'min',
+#                 '25%': '25\\%',
+#                 '50%': '50\\%',
+#                 '75%': '75\\%',
+#                 'max': 'max'
+#             }
+
+#             for stat_key, stat_label in stats_display.items():
+#                 row_parts = [stat_label]
+#                 for col in columns:
+#                     if col in stats_df and stat_key in stats_df[col]:
+#                         val = stats_df[col].get(stat_key)
+#                         # Format integers without decimals
+#                         if stat_key == 'count':
+#                             row_parts.append(str(int(val)) if val is not None else '—')
+#                         else:
+#                             row_parts.append(_format_metric(val, decimals=3))
+#                     else:
+#                         row_parts.append('—')
+#                 latex.append(" & ".join(row_parts) + " \\\\")
+
+#             latex.append(r"\bottomrule")
+#             latex.append(r"\end{tabular}")
+
+#             if len(columns) > 5:
+#                 latex.append(r"}")
+#                 latex.append(r"\end{adjustbox}")
+
+#             latex.append(r"\end{table}")
+#             latex.append("")
+
+#             # Add footnote with full column names if abbreviated
+#             if len(columns) > 0:
+#                 latex.append(r"\noindent\textit{Note: Column abbreviations — ")
+#                 abbrev_list = []
+#                 for i, col in enumerate(columns):
+#                     abbrev = col_headers[i]
+#                     if abbrev != col:
+#                         abbrev_list.append(f"{abbrev}: {_escape_latex(col)}")
+#                 if abbrev_list:
+#                     latex.append("; ".join(abbrev_list) + "}")
+#                     latex.append(r"")
+#                 latex.append("")
+
+#     return "\n".join(latex)
+
+
+# def _build_class_distribution_section(pandas_results: Dict[str, Any]) -> str:
+#     """Build Class Distribution section (before/after SMOTE if applicable)."""
+#     latex = []
+
+#     target_dist = pandas_results.get('target_distribution', {})
+#     if not target_dist:
+#         return ""
+
+#     latex.append(r"\textbf{Class Distribution}")
+#     latex.append(r"\bigskip")
+#     latex.append("")
+
+#     # Check if we have SMOTE comparison data
+#     original_dist = target_dist.get('original', {})
+#     smote_dist = target_dist.get('smote', {}) or target_dist.get('after_smote', {})
+
+#     if original_dist and smote_dist:
+#         # SMOTE comparison table (Table 3 style)
+#         latex.append(r"\begin{table}[H]")
+#         latex.append(r"\centering")
+#         latex.append(r"\caption{SMOTE class distribution comparison}")
+#         latex.append(r"\label{tab:smote_comparison}")
+#         latex.append(r"\begin{tabular}{c c c c c}")
+#         latex.append(r"\toprule")
+#         latex.append(r"Class & Orig. Cnt. & SMOTE Cnt. & Orig. \% & SMOTE \% \\")
+#         latex.append(r"\midrule")
+
+#         orig_total = sum(original_dist.values()) if original_dist else 1
+#         smote_total = sum(smote_dist.values()) if smote_dist else 1
+
+#         for class_label in sorted(original_dist.keys()):
+#             orig_count = original_dist.get(class_label, 0)
+#             smote_count = smote_dist.get(class_label, 0)
+#             orig_pct = 100.0 * orig_count / orig_total if orig_total > 0 else 0
+#             smote_pct = 100.0 * smote_count / smote_total if smote_total > 0 else 0
+
+#             latex.append(f"{_escape_latex(str(class_label))} & {orig_count} & {smote_count} & "
+#                         f"{orig_pct:.0f} & {smote_pct:.0f} \\\\")
+
+#         latex.append(r"\bottomrule")
+#         latex.append(r"\end{tabular}")
+#         latex.append(r"\end{table}")
+#         latex.append("")
+
+#     elif original_dist:
+#         # Original class distribution only
+#         latex.append(r"\begin{table}[H]")
+#         latex.append(r"\centering")
+#         latex.append(r"\caption{Original Class Distribution}")
+#         latex.append(r"\label{tab:class_dist_original}")
+#         latex.append(r"\begin{tabular}{l r r}")
+#         latex.append(r"\toprule")
+#         latex.append(r"Class & Count & Percentage \\")
+#         latex.append(r"\midrule")
+
+#         total = sum(original_dist.values()) if original_dist else 1
+#         for class_label in sorted(original_dist.keys()):
+#             count = original_dist[class_label]
+#             pct = 100.0 * count / total if total > 0 else 0
+#             latex.append(f"{_escape_latex(str(class_label))} & {count} & {pct:.2f}\\% \\\\")
+
+#         latex.append(r"\bottomrule")
+#         latex.append(r"\end{tabular}")
+#         latex.append(r"\end{table}")
+#         latex.append("")
+
+#     return "\n".join(latex)
+
+
+# def _build_group_best_section(run_data: Dict[str, Any]) -> str:
+#     """Build Best-per-Group Models section."""
+#     latex = []
+
+#     best_models = run_data.get('best_models_by_group', [])
+#     if not best_models:
+#         return ""
+
+#     latex.append(r"\textbf{Best Model per Group}")
+#     latex.append(r"\bigskip")
+#     latex.append("")
+
+#     latex.append(r"\begin{table}[H]")
+#     latex.append(r"\centering")
+#     latex.append(r"\caption{Best Model per Group}")
+#     latex.append(r"\label{tab:best_per_group}")
+#     latex.append(r"\begin{adjustbox}{width=\textwidth}")
+#     latex.append(r"{\tiny")
+#     latex.append(r"\begin{tabular}{l p{3cm} c c c c c c c c}")
+#     latex.append(r"\toprule")
+#     latex.append(r"Group & Model & AUC & PCC & F1 & Recall & BS & KS & PG & H \\")
+#     latex.append(r"\midrule")
+
+#     for model in best_models:
+#         metrics = model.get('metrics', {})
+#         group = _escape_latex(model.get('model_group', 'N/A'))
+#         model_name = _escape_latex(model.get('model_name', 'N/A'))
+
+#         row = (
+#             f"{group} & {model_name} & "
+#             f"{_format_metric(metrics.get('AUC'))} & "
+#             f"{_format_metric(metrics.get('PCC'))} & "
+#             f"{_format_metric(metrics.get('F1'))} & "
+#             f"{_format_metric(metrics.get('Recall'))} & "
+#             f"{_format_metric(metrics.get('BS'))} & "
+#             f"{_format_metric(metrics.get('KS'))} & "
+#             f"{_format_metric(metrics.get('PG'))} & "
+#             f"{_format_metric(metrics.get('H'))} \\\\"
+#         )
+#         latex.append(row)
+
+#     latex.append(r"\bottomrule")
+#     latex.append(r"\end{tabular}")
+#     latex.append(r"}")
+#     latex.append(r"\end{adjustbox}")
+#     latex.append(r"\end{table}")
+#     latex.append("")
+
+#     return "\n".join(latex)
+
+
+def _build_shap_analysis_section(shap_results: Dict[str, Any]) -> str:
+    """Build SHAP Analysis section with feature importance details.
+
+    Generates a publication-grade LaTeX table displaying:
+    - Rank, Feature, Mean |SHAP|, Mean SHAP, Std SHAP, Direction, Avg Rank, Stability
+
+    Based on the SHAP Analysis section structure from the UI.
+    """
+    latex = []
+
+    if not shap_results:
+        return ""
+
+    global_importance = shap_results.get('global_importance', [])
+    if not global_importance:
+        return ""
+
+    latex.append(r"\subsection*{SHAP Analysis --- Model Interpretability}")
+    latex.append("")
+    latex.append(r"Feature Importance Details from SHAP (SHapley Additive exPlanations) analysis.")
+    latex.append(r"\bigskip")
+    latex.append("")
+
+    # Build table with all features
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Feature Importance Details (SHAP Analysis)}")
+    latex.append(r"\label{tab:shap_importance}")
+    latex.append(r"\begin{adjustbox}{width=\textwidth}")
+    latex.append(r"\small")
+
+    # Table structure: Rank | Feature | Mean |SHAP| | Mean SHAP | Std SHAP | Direction | Avg Rank | Stability
+    latex.append(r"\begin{tabular}{c l r r r c r l}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Rank} & \textbf{Feature} & \textbf{Mean |SHAP|} & \textbf{Mean SHAP} & \textbf{Std SHAP} & \textbf{Direction} & \textbf{Avg Rank} & \textbf{Stability} \\")
+    latex.append(r"\midrule")
+
+    for row in global_importance:
+        rank = row.get('rank', '')
+        feature = _escape_latex(str(row.get('feature', '')))
+        mean_abs_shap = _format_metric(row.get('abs_mean_shap'), decimals=4)
+        mean_shap = _format_metric(row.get('mean_shap'), decimals=4)
+        std_shap = _format_metric(row.get('std_shap'), decimals=4)
+
+        # Direction indicator
+        sign = row.get('sign')
+        if sign == 1:
+            direction = r"$\uparrow$ Positive"
+        elif sign == -1:
+            direction = r"$\downarrow$ Negative"
+        else:
+            direction = "—"
+
+        # Stability assessment based on std_rank
+        avg_rank = _format_metric(row.get('avg_rank'), decimals=1)
+        std_rank = row.get('std_rank')
+        if std_rank is not None:
+            if std_rank < 1.0:
+                stability = "Stable"
+            elif std_rank < 2.0:
+                stability = "Moderate"
+            else:
+                stability = "Variable"
+        else:
+            stability = "—"
+
+        latex.append(f"{rank} & {feature} & {mean_abs_shap} & {mean_shap} & {std_shap} & {direction} & {avg_rank} & {stability} \\\\")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{adjustbox}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    # Add reliability summary if available
+    reliability_summary = shap_results.get('reliability_summary', '')
+    sanity_ratio = shap_results.get('sanity_ratio')
+    metadata = shap_results.get('metadata', {})
+
+    if reliability_summary or sanity_ratio is not None:
+        latex.append(r"\textbf{Analysis Reliability Assessment}")
+        latex.append(r"\bigskip")
+        latex.append("")
+
+        # Add sanity ratio with interpretation if available
+        if sanity_ratio is not None:
+            sanity_ratio_formatted = _format_metric(sanity_ratio, decimals=4)
+
+            # Determine sanity interpretation
+            if sanity_ratio >= 0.95:
+                sanity_interpretation = "Strong signal --- explanations are reliable"
+            elif sanity_ratio >= 0.85:
+                sanity_interpretation = "Moderate signal --- reasonable reliability"
+            else:
+                sanity_interpretation = "Weak signal --- explanations may be dominated by noise"
+
+            latex.append(r"\noindent\textbf{Model Randomization Sanity Check}")
+            latex.append(r"\medskip")
+            latex.append("")
+            latex.append(f"{sanity_ratio_formatted} \quad {sanity_interpretation}")
+            latex.append(r"\medskip")
+            latex.append("")
+
+            # Add sanity check explanation
+            latex.append(r"\noindent\textit{Ratio of SHAP value magnitude (original labels vs. randomized labels). Values $\geq 0.95$ indicate explanations are driven by genuine model-data structure.}")
+            latex.append(r"\bigskip")
+            latex.append("")
+
+        # Format reliability summary as main narrative
+        if reliability_summary:
+            latex.append(r"\textbf{Summary}")
+            latex.append(r"\medskip")
+            latex.append("")
+            summary_text = reliability_summary.replace('\n', ' ').strip()
+            latex.append(_escape_latex(summary_text))
+            latex.append(r"\bigskip")
+            latex.append("")
+
+        # Add model information
+        model_info = shap_results.get('model_info', {})
+        if model_info:
+            latex.append(r"\textbf{Model Information}")
+            latex.append(r"\medskip")
+            latex.append("")
+
+            if 'model_name' in model_info:
+                latex.append(f"Model: {_escape_latex(model_info['model_name'])}")
+            if 'model_group' in model_info:
+                latex.append(f"Group: {_escape_latex(model_info['model_group'])}")
+
+            # Source information
+            if 'source' in model_info:
+                source = model_info['source']
+                source_display = {
+                    'loaded_best': 'Loaded (Best Model)',
+                    'loaded_from_run': 'Loaded (From Run)',
+                    'provided': 'Provided',
+                    'trained_new': 'Trained (Logistic Regression)',
+                    'trained_fallback': 'Trained (Fallback)'
+                }.get(source, source)
+                latex.append(f"Source: {source_display}")
+
+            # Model metrics if available
+            if 'metrics' in model_info:
+                metrics = model_info['metrics']
+                if 'test_f1' in metrics:
+                    latex.append(f"Model F1 Score: {_format_metric(metrics['test_f1'], decimals=4)}")
+                if 'test_auc' in metrics:
+                    latex.append(f"Model AUC: {_format_metric(metrics['test_auc'], decimals=4)}")
+
+            # Model run timestamp if available
+            if 'run_timestamp' in model_info:
+                from datetime import datetime
+                try:
+                    ts = datetime.fromisoformat(model_info['run_timestamp'])
+                    run_str = ts.strftime("%d/%m/%Y, %H:%M:%S %p")
+                    latex.append(f"Model Run: {run_str}")
+                except Exception:
+                    latex.append(f"Model Run: {model_info['run_timestamp']}")
+
+            latex.append("")
+
+        # Add analysis parameters
+        if metadata:
+            latex.append(r"\textbf{Analysis Parameters}")
+            latex.append(r"\medskip")
+            latex.append("")
+
+            if 'n_trials' in metadata:
+                latex.append(f"Stability Trials: {metadata['n_trials']}")
+            if 'bg_size' in metadata:
+                latex.append(f"Background Size: {metadata['bg_size']}")
+            if 'n_features' in metadata:
+                latex.append(f"Features Analyzed: {metadata['n_features']}")
+            if 'timestamp' in metadata:
+                from datetime import datetime
+                try:
+                    ts = datetime.fromisoformat(metadata['timestamp'])
+                    computed_str = ts.strftime("%d/%m/%Y, %H:%M:%S %p")
+                    latex.append(f"Computed: {computed_str}")
+                except Exception:
+                    latex.append(f"Computed: {metadata['timestamp']}")
+
+            latex.append("")
+
+    return "\n".join(latex)
+
+
+# def _build_shap_analysis_section(shap_results: Dict[str, Any]) -> str:
+#     """Build SHAP Analysis section with summary statistics."""
+#     latex = []
+
+#     if not shap_results:
+#         return ""
+
+#     latex.append(r"\textbf{SHAP Analysis — Model Interpretability}")
+#     latex.append(r"\bigskip")
+#     latex.append("")
+
+#     # SHAP Summary
+#     summary = shap_results.get('summary', {})
+#     if summary:
+#         latex.append(r"\begin{table}[H]")
+#         latex.append(r"\centering")
+#         latex.append(r"\caption{SHAP Analysis Summary}")
+#         latex.append(r"\label{tab:shap_summary}")
+#         latex.append(r"\begin{tabular}{l r}")
+#         latex.append(r"\toprule")
+#         latex.append(r"Metric & Value \\")
+#         latex.append(r"\midrule")
+
+#         for key, value in summary.items():
+#             key_display = _escape_latex(str(key))
+#             value_display = _format_metric(value) if isinstance(value, (int, float)) else _escape_latex(str(value))
+#             latex.append(f"{key_display} & {value_display} \\\\")
+
+#         latex.append(r"\bottomrule")
+#         latex.append(r"\end{tabular}")
+#         latex.append(r"\end{table}")
+#         latex.append("")
+
+#     # Feature Contributions
+#     feature_contributions = shap_results.get('feature_contributions', {})
+#     if feature_contributions:
+#         latex.append(r"\textbf{Top Feature Contributions (SHAP Values)}")
+#         latex.append(r"\bigskip")
+#         latex.append("")
+
+#         latex.append(r"\begin{table}[H]")
+#         latex.append(r"\centering")
+#         latex.append(r"\caption{SHAP Feature Contributions (Top 15)}")
+#         latex.append(r"\label{tab:shap_features}")
+#         latex.append(r"\begin{adjustbox}{width=\textwidth}")
+#         latex.append(r"{\tiny")
+#         latex.append(r"\begin{tabular}{p{3cm} c c}")
+#         latex.append(r"\toprule")
+#         latex.append(r"Feature & Mean |SHAP| & Impact \\")
+#         latex.append(r"\midrule")
+
+#         sorted_features = sorted(
+#             feature_contributions.items(),
+#             key=lambda x: x[1].get('mean_abs_shap', 0),
+#             reverse=True
+#         )[:15]
+
+#         for feature, contrib in sorted_features:
+#             feature_display = _escape_latex(str(feature))
+#             mean_shap = _format_metric(contrib.get('mean_abs_shap', 0))
+#             impact = _escape_latex(contrib.get('impact', 'N/A'))
+#             latex.append(f"{feature_display} & {mean_shap} & {impact} \\\\")
+
+#         latex.append(r"\bottomrule")
+#         latex.append(r"\end{tabular}")
+#         latex.append(r"}")
+#         latex.append(r"\end{adjustbox}")
+#         latex.append(r"\end{table}")
+#         latex.append("")
+
+#     return "\n".join(latex)
+
+
+# def generate_summary_statistics_table(
+#     stats_data: Dict[str, Dict[str, Any]],
+#     caption: str = "Summary statistics",
+#     label: str = "tab:summary_stats",
+#     column_abbreviations: Optional[Dict[str, str]] = None
+# ) -> str:
+#     """
+#     Generate a summary statistics table (Table 2 style from screenshot).
+
+#     Args:
+#         stats_data: Dictionary of {column_name: {stat_name: value}}
+#         caption: Table caption
+#         label: LaTeX label
+#         column_abbreviations: Optional mapping of {full_name: abbrev}
+
+#     Example:
+#         stats_data = {
+#             'Duration': {'count': 1000, 'mean': 20.900, 'std': 12.060, ...},
+#             'Amount': {'count': 1000, 'mean': 3271.260, 'std': 2822.740, ...}
+#         }
+#     """
+#     if not stats_data:
+#         return ""
+
+#     latex = []
+#     columns = list(stats_data.keys())
+
+#     # Determine column headers (abbreviated or full)
+#     if column_abbreviations:
+#         col_headers = [column_abbreviations.get(col, col) for col in columns]
+#     else:
+#         col_headers = [col[:4] if len(col) > 4 else col for col in columns]
+
+#     latex.append(r"\begin{table}[H]")
+#     latex.append(r"\centering")
+#     latex.append(f"\\caption{{{_escape_latex(caption)}}}")
+#     latex.append(f"\\label{{{label}}}")
+
+#     if len(columns) > 5:
+#         latex.append(r"\begin{adjustbox}{width=\textwidth}")
+#         latex.append(r"{\tiny")
+#     else:
+#         latex.append(r"\footnotesize")
+
+#     col_spec = "l" + (" c" * len(columns))
+#     latex.append(f"\\begin{{tabular}}{{{col_spec}}}")
+#     latex.append(r"\toprule")
+
+#     # Header
+#     header = " & ".join([_escape_latex(h) for h in col_headers]) + " \\\\"
+#     latex.append(header)
+#     latex.append(r"\midrule")
+
+#     # Stats rows
+#     stats_rows = [
+#         ('count', 'count'),
+#         ('mean', 'mean'),
+#         ('std', 'std'),
+#         ('min', 'min'),
+#         ('25%', '25\\%'),
+#         ('50%', '50\\%'),
+#         ('75%', '75\\%'),
+#         ('max', 'max')
+#     ]
+
+#     for stat_key, stat_label in stats_rows:
+#         row_parts = [stat_label]
+#         for col in columns:
+#             if col in stats_data and stat_key in stats_data[col]:
+#                 val = stats_data[col][stat_key]
+#                 if stat_key == 'count':
+#                     row_parts.append(str(int(val)) if val is not None else '—')
+#                 else:
+#                     row_parts.append(_format_metric(val, decimals=3))
+#             else:
+#                 row_parts.append('—')
+#         latex.append(" & ".join(row_parts) + " \\\\")
+
+#     latex.append(r"\bottomrule")
+#     latex.append(r"\end{tabular}")
+
+#     if len(columns) > 5:
+#         latex.append(r"}")
+#         latex.append(r"\end{adjustbox}")
+
+#     latex.append(r"\end{table}")
+
+#     # Add abbreviation notes
+#     if column_abbreviations or len(col_headers) > 0:
+#         abbrev_list = []
+#         for i, col in enumerate(columns):
+#             abbrev = col_headers[i]
+#             if abbrev != col:
+#                 abbrev_list.append(f"{abbrev}: {_escape_latex(col)}")
+#         if abbrev_list:
+#             latex.append("")
+#             latex.append(r"\noindent\textit{Note: " + "; ".join(abbrev_list) + ".}")
+
+#     latex.append("")
+#     return "\n".join(latex)
+
+
+# def generate_smote_comparison_table(
+#     original_dist: Dict[Any, int],
+#     smote_dist: Dict[Any, int],
+#     caption: str = "SMOTE class distribution comparison",
+#     label: str = "tab:smote_comparison"
+# ) -> str:
+#     """
+#     Generate a SMOTE before/after comparison table (Table 3 style).
+
+#     Args:
+#         original_dist: Original class distribution {class: count}
+#         smote_dist: SMOTE class distribution {class: count}
+#         caption: Table caption
+#         label: LaTeX label
+
+#     Example:
+#         original_dist = {0: 700, 1: 300}
+#         smote_dist = {0: 560, 1: 560}
+#     """
+#     if not original_dist or not smote_dist:
+#         return ""
+
+#     latex = []
+#     latex.append(r"\begin{table}[H]")
+#     latex.append(r"\centering")
+#     latex.append(f"\\caption{{{_escape_latex(caption)}}}")
+#     latex.append(f"\\label{{{label}}}")
+#     latex.append(r"\begin{tabular}{c c c c c}")
+#     latex.append(r"\toprule")
+#     latex.append(r"Class & Orig. Cnt. & SMOTE Cnt. & Orig. \% & SMOTE \% \\")
+#     latex.append(r"\midrule")
+
+#     orig_total = sum(original_dist.values())
+#     smote_total = sum(smote_dist.values())
+
+#     for class_label in sorted(original_dist.keys()):
+#         orig_count = original_dist.get(class_label, 0)
+#         smote_count = smote_dist.get(class_label, 0)
+#         orig_pct = 100.0 * orig_count / orig_total if orig_total > 0 else 0
+#         smote_pct = 100.0 * smote_count / smote_total if smote_total > 0 else 0
+
+#         latex.append(f"{_escape_latex(str(class_label))} & {orig_count} & {smote_count} & "
+#                     f"{orig_pct:.0f} & {smote_pct:.0f} \\\\")
+
+#     latex.append(r"\bottomrule")
+#     latex.append(r"\end{tabular}")
+#     latex.append(r"\end{table}")
+#     latex.append("")
+
+#     return "\n".join(latex)
+
+
+# def generate_feature_importance_table(
+#     features: List[Dict[str, Any]],
+#     caption: str = "Top features by combined RF/LR importance",
+#     label: str = "tab:feature_importance",
+#     max_features: int = 20
+# ) -> str:
+#     """
+#     Generate a feature importance table (Table 4 style).
+
+#     Args:
+#         features: List of feature dicts with keys like:
+#                   {'feature': name, 'rf_importance': val, 'lr_coefficient': val, 'average': val}
+#         caption: Table caption
+#         label: LaTeX label
+#         max_features: Maximum number of features to show
+
+#     Example:
+#         features = [
+#             {'feature': 'months_duration', 'rf_importance': 0.076, 'lr_coefficient': 1.983, 'average': 0.921},
+#             {'feature': 'credit_amount', 'rf_importance': 0.090, 'lr_coefficient': 1.386, 'average': 0.849}
+#         ]
+#     """
+#     if not features:
+#         return ""
+
+#     latex = []
+#     latex.append(r"\begin{table}[H]")
+#     latex.append(r"\centering")
+#     latex.append(f"\\caption{{{_escape_latex(caption)}}}")
+#     latex.append(f"\\label{{{label}}}")
+#     latex.append(r"\begin{adjustbox}{width=\textwidth}")
+#     latex.append(r"{\footnotesize")
+#     latex.append(r"\begin{tabular}{c p{5cm} c c c}")
+#     latex.append(r"\toprule")
+#     latex.append(r"Rank & Feature & RF Imp. & LR [Coef] & Avg. \\")
+#     latex.append(r"\midrule")
+
+#     display_features = features[:max_features]
+
+#     for idx, feat in enumerate(display_features, 1):
+#         feature_name = _escape_latex(feat.get('feature', feat.get('name', 'N/A')))
+#         rf_imp = _format_metric(feat.get('rf_importance', feat.get('rf_imp', 0)), decimals=3)
+#         lr_coef = _format_metric(feat.get('lr_coefficient', feat.get('lr_coef', 0)), decimals=3)
+#         avg = _format_metric(feat.get('average', feat.get('avg', 0)), decimals=3)
+
+#         latex.append(f"{idx} & {feature_name} & {rf_imp} & {lr_coef} & {avg} \\\\")
+
+#     latex.append(r"\bottomrule")
+#     latex.append(r"\end{tabular}")
+#     latex.append(r"}")
+#     latex.append(r"\end{adjustbox}")
+#     latex.append(r"\end{table}")
+#     latex.append("")
+
+#     return "\n".join(latex)
+
+
+def generate_results_section(
+    run_data: Dict[str, Any],
+    dataset_metadata: Dict[str, Any],
+    pandas_results: Dict[str, Any],
+    fi_results: Dict[str, Any],
+    shap_results: Dict[str, Any],
+    image_paths: Dict[str, str],
+    smote_results: Dict[str, Any] = None,
+    dataset_quality_summary: List[Dict[str, Any]] = None,
+    statistical_tests: List[Dict[str, Any]] = None,
+    label_randomization: Dict[str, Any] = None,
+    validated_commentaries: List[Dict[str, Any]] = None
+) -> str:
+    """
+    Generate complete publication-grade Results section from all artifacts.
+
+    Args:
+        run_data: Model execution results including all models, best models, benchmark
+        dataset_metadata: Dataset metadata (rows, columns, target)
+        pandas_results: Descriptive statistics, class distributions, etc.
+        fi_results: Feature importance tables (rf, lr, merged)
+        shap_results: SHAP analysis results
+        image_paths: Paths to generated visualizations
+        smote_results: SMOTE analysis results (optional)
+        dataset_quality_summary: Dataset quality summary (Table X) (optional)
+        statistical_tests: Statistical significance test results (optional)
+        label_randomization: Label randomization test results (optional)
+        validated_commentaries: Validated commentary with evidence layers (optional)
+
+    Returns:
+        Complete LaTeX Results section (without document wrapper)
+    """
+    latex = []
+
+    # Build all sections in order
+
+    # Dataset Quality Summary (Table X) - if available, show FIRST
+    if dataset_quality_summary:
+        from services.dataset_quality_latex import generate_dataset_quality_subsection
+        filename = dataset_metadata.get('filename', '')
+        latex.append(generate_dataset_quality_subsection(dataset_quality_summary, filename))
+        latex.append("")
+
+    latex.append(_build_feature_importance_section(fi_results, image_paths))
+    latex.append("")
+
+    if smote_results:
+        latex.append(_smote_distribution_table(smote_results))
+        latex.append("")
+
+    latex.append(_build_model_performance_section(run_data))
+    latex.append("")
+
+    latex.append(_build_benchmark_section(run_data))
+    latex.append("")
+
+    if shap_results:
+        latex.append(_build_shap_analysis_section(shap_results))
+        latex.append("")
+
+    # Add statistical robustness table (summary table first)
+    if statistical_tests:
+        from services.statistical_tests_latex import generate_statistical_robustness_table
+        filename = dataset_metadata.get('filename', '')
+        latex.append(generate_statistical_robustness_table(statistical_tests, filename))
+        latex.append("")
+
+    # Add detailed statistical significance tests section
+    if statistical_tests:
+        from services.statistical_tests_latex import generate_statistical_tests_section
+        filename = dataset_metadata.get('filename', '')
+        latex.append(generate_statistical_tests_section(statistical_tests, filename))
+        latex.append("")
+
+    # Add label randomization test section
+    if label_randomization:
+        from services.label_randomization_latex import generate_label_randomization_section
+        import numpy as np
+
+        # Extract original SHAP values if available
+        original_shap_values = None
+        if shap_results and 'shap_values' in shap_results:
+            try:
+                original_shap_values = np.array(shap_results['shap_values'])
+            except Exception as e:
+                print(f"Warning: Could not extract original SHAP values: {e}")
+
+        lr_section = generate_label_randomization_section(
+            label_randomization_result=label_randomization,
+            original_shap_values=original_shap_values
+        )
+
+        if lr_section:
+            latex.append(lr_section)
+            latex.append("")
+
+    # Add validated commentaries section
+    if validated_commentaries and len(validated_commentaries) > 0:
+        from services.validated_commentary_latex import generate_multiple_commentaries_section
+
+        filename = dataset_metadata.get('filename', 'Dataset')
+        commentaries_section = generate_multiple_commentaries_section(
+            commentaries=validated_commentaries,
+            dataset_filename=filename
+        )
+
+        if commentaries_section:
+            latex.append(commentaries_section)
+            latex.append("")
+
+    # latex.append(_build_dataset_overview_section(dataset_metadata, pandas_results))
+    # latex.append("")
+
+    # latex.append(_build_class_distribution_section(pandas_results))
+    # latex.append("")
+
+    # latex.append(_build_group_best_section(run_data))
+    # latex.append("")
+    # --- Generic tables from DB artifacts ---
+    # Include any list-like pandas_results (e.g., precomputed tables)
+    # try:
+    #     for name, table in pandas_results.items():
+    #         if isinstance(table, list) and table:
+    #             caption = f"Pandas Result: {name}"
+    #             label = f"tab:pandas_{name}"
+    #             latex.append(generate_latex_table_from_records(table, caption, label))
+    # except Exception:
+    #     pass
+
+    # # Include feature importance tables (rf_table, lr_table, merged_table) if present
+    # try:
+    #     for key, tbl in fi_results.items():
+    #         if isinstance(tbl, list) and tbl:
+    #             caption = f"Feature Importance: {key}"
+    #             label = f"tab:fi_{key}"
+    #             latex.append(generate_latex_table_from_records(tbl, caption, label))
+    # except Exception:
+    #     pass
+
+    # Include Column Summary table (log the raw table for inspection)
+    # try:
+    #     logger = logging.getLogger(__name__)
+    #     # determine filename for logging context
+    #     filename = None
+    #     if isinstance(run_data, dict):
+    #         filename = run_data.get('filename')
+    #     if not filename and isinstance(dataset_metadata, dict):
+    #         filename = dataset_metadata.get('filename')
+
+    #     for key, tbl in pandas_results.items():
+    #         if key == "column_summary" and isinstance(tbl, (list, dict)) and tbl:
+    #             # Log the table content (attempt JSON dump)
+    #             try:
+    #                 logger.info("column_summary for %s:\n%s", filename or '<unknown>', json.dumps(tbl, indent=2, default=str))
+    #             except Exception:
+    #                 logger.info("column_summary for %s (raw): %r", filename or '<unknown>', tbl)
+
+    #             # Render into LaTeX
+    #             if isinstance(tbl, list):
+    #                 caption = f"Column Summary: {key}"
+    #                 label = f"tab:{key}"
+    #                 latex.append(generate_latex_table_from_records(tbl, caption, label))
+    #             elif isinstance(tbl, dict):
+    #                 caption = f"Summary statistics for {filename or ''}"
+    #                 label = f"tab:summary_{str(filename or '').replace(' ', '_').replace('.', '_')}"
+    #                 latex.append(generate_summary_statistics_table(tbl, caption=caption, label=label))
+    # except Exception:
+    #     # swallow logging/render errors to avoid breaking report generation
+    #     pass
+
+    # Filter out empty strings
+    latex = [section for section in latex if section.strip()]
+
+    return "\n".join(latex)

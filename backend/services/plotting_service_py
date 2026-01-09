@@ -1,0 +1,134 @@
+"""
+Plotting service for data visualization.
+Generates matplotlib/seaborn plots and saves to disk.
+No Flask, no database - only plot generation.
+"""
+
+import os
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import seaborn as sns
+from config import get_images_dir, MAX_PAIRPLOT_COLUMNS
+from services.pairplot_selector import select_pairplot_variables
+
+
+def generate_pairplot(df, filename):
+    """
+    Generate and save intelligent pairplot using only quantitative variables.
+    Excludes binary, ternary, and low-entropy categorical variables.
+    Uses target as hue for class-conditional visualization.
+    Returns relative image path or None if not enough quantitative columns.
+    """
+    # Use intelligent variable selection
+    axis_vars, hue_var, excluded, metadata = select_pairplot_variables(
+        df,
+        target_column='target',
+        min_vars=2,
+        max_vars=MAX_PAIRPLOT_COLUMNS
+    )
+
+    if len(axis_vars) < 2:
+        print(f"Insufficient quantitative variables for pairplot: {len(axis_vars)}")
+        print(f"Excluded {len(excluded)} low-entropy/categorical variables")
+        return None
+
+    try:
+        # Create column list with hue variable if available
+        plot_cols = axis_vars.copy()
+        if hue_var and hue_var in df.columns:
+            plot_cols.append(hue_var)
+
+        # Drop rows with NaN in the selected columns for cleaner visualization
+        plot_df = df[plot_cols].dropna()
+
+        if len(plot_df) < 2:
+            # Not enough data points after dropping NaNs
+            return None
+
+        plt.figure(figsize=(12, 10))
+
+        # Generate pairplot with hue if available
+        if hue_var and hue_var in df.columns:
+            sns.pairplot(plot_df, hue=hue_var, diag_kind='kde', plot_kws={'alpha': 0.6})
+        else:
+            sns.pairplot(plot_df, diag_kind='kde', plot_kws={'alpha': 0.6})
+
+        image_filename = f"{filename.replace('.csv', '')}_pairplot.png"
+        image_path = os.path.join(get_images_dir(), image_filename)
+        plt.savefig(image_path, bbox_inches='tight', dpi=100)
+        plt.close('all')
+
+        # Log selection results
+        print(f"Pairplot generated with {len(axis_vars)} quantitative variables: {axis_vars}")
+        if excluded:
+            excluded_names = [item['column'] for item in excluded]
+            print(f"Excluded {len(excluded)} variables: {excluded_names}")
+
+        return f"/images/{image_filename}"
+    except Exception as e:
+        print(f"Error generating pairplot: {str(e)}")
+        plt.close('all')
+        return None
+
+
+def generate_correlation_heatmap(df, filename):
+    """
+    Generate and save correlation heatmap.
+    Returns relative image path or None if not enough numeric columns.
+    Handles NaN values - corr() automatically skips NaN values.
+    """
+    numeric_df = df.select_dtypes(include=['number'])
+
+    if numeric_df.shape[1] < 2:
+        return None
+
+    try:
+        plt.figure(figsize=(10, 8))
+        # corr() automatically handles NaN by skipping them
+        correlation = numeric_df.corr()
+        sns.heatmap(correlation, annot=True, fmt='.2f', cmap='coolwarm',
+                   center=0, square=True, linewidths=1)
+        plt.title('Correlation Heatmap')
+        plt.tight_layout()
+
+        image_filename = f"{filename.replace('.csv', '')}_correlation.png"
+        image_path = os.path.join(get_images_dir(), image_filename)
+        plt.savefig(image_path, bbox_inches='tight', dpi=100)
+        plt.close('all')
+
+        return f"/images/{image_filename}"
+    except Exception as e:
+        print(f"Error generating correlation heatmap: {str(e)}")
+        plt.close('all')
+        return None
+
+
+def generate_feature_importance_chart(merged_df, filename):
+    """
+    Generate horizontal bar chart for feature importance.
+    merged_df must have 'feature' and 'avg_score' columns.
+    Returns relative image path or None on error.
+    """
+    try:
+        # Sort by avg_score and take top 20 features
+        top_features = merged_df.sort_values('avg_score', ascending=True).tail(20)
+
+        plt.figure(figsize=(10, 8))
+        plt.barh(top_features['feature'], top_features['avg_score'], color='steelblue')
+        plt.xlabel('Average Importance Score')
+        plt.ylabel('Feature')
+        plt.title('Feature Importance (Top 20)')
+        plt.tight_layout()
+
+        image_filename = f"{filename.replace('.csv', '')}_feature_importance.png"
+        image_path = os.path.join(get_images_dir(), image_filename)
+        plt.savefig(image_path, bbox_inches='tight', dpi=100)
+        plt.close('all')
+
+        return f"/images/{image_filename}"
+    except Exception as e:
+        print(f"Error generating feature importance chart: {str(e)}")
+        plt.close('all')
+        return None

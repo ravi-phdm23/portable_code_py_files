@@ -1,0 +1,59 @@
+import pandas as pd
+
+
+def build_dataset_quality_summary(df: pd.DataFrame) -> list[dict]:
+    """
+    Build Table X: Dataset Structure and Quality Summary.
+
+    One row per variable.
+    Output is JSON-serialisable and paper-ready.
+    """
+
+    n_rows = len(df)
+    rows = []
+
+    for col in df.columns:
+        s = df[col]
+
+        non_null = s.notna().sum()
+        missing_pct = round((n_rows - non_null) / n_rows * 100, 1)
+        unique = s.nunique(dropna=False)
+
+        # Determine type
+        if unique == 2:
+            var_type = "Binary"
+        elif pd.api.types.is_numeric_dtype(s):
+            var_type = "Numeric"
+        else:
+            var_type = "Categorical"
+
+        row = {
+            "Variable": col,
+            "Type": var_type,
+            "Missing (%)": missing_pct,
+            "Unique": int(unique),
+            "Dominant value (%)": "—",
+            "Mean (if numeric)": "—"
+        }
+
+        if var_type == "Numeric":
+            if non_null > 0:
+                mean_val = s.mean()
+                # Handle NaN values from s.mean() to prevent JSON serialization errors
+                if pd.notna(mean_val):
+                    row["Mean (if numeric)"] = round(float(mean_val), 3)
+                else:
+                    row["Mean (if numeric)"] = "—"
+
+        else:
+            vc = s.value_counts(dropna=False)
+            if not vc.empty:
+                top_val = vc.index[0]
+                top_pct = round((vc.iloc[0] / n_rows) * 100, 1)
+                row["Dominant value (%)"] = f"{top_val} ({top_pct})"
+
+        rows.append(row)
+
+    # Sort by Type (category) to ensure consistent ordering
+    sorted_rows = sorted(rows, key=lambda x: x["Type"])
+    return sorted_rows

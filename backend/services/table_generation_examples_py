@@ -1,0 +1,220 @@
+"""
+Example usage of the table generation functions in results_section_generator.py
+
+This file demonstrates how to use the new table generation functions to create
+publication-quality LaTeX tables matching the styles shown in research papers.
+"""
+
+from results_section_generator import (
+    generate_summary_statistics_table,
+    generate_smote_comparison_table,
+    generate_feature_importance_table,
+    generate_flexible_latex_table
+)
+
+
+# =============================================================================
+# Example 1: Summary Statistics Table (Table 2 style)
+# =============================================================================
+
+def example_summary_statistics():
+    """Generate a summary statistics table for dataset features."""
+
+    # Sample data structure
+    stats_data = {
+        'Duration': {
+            'count': 1000,
+            'mean': 20.900,
+            'std': 12.060,
+            'min': 4,
+            '25%': 12,
+            '50%': 18,
+            '75%': 24,
+            'max': 72
+        },
+        'Amount': {
+            'count': 1000,
+            'mean': 3271.260,
+            'std': 2822.740,
+            'min': 250,
+            '25%': 1365.500,
+            '50%': 2319.500,
+            '75%': 3972.250,
+            'max': 18424
+        },
+        'Installment_rate': {
+            'count': 1000,
+            'mean': 2.970,
+            'std': 1.120,
+            'min': 1,
+            '25%': 2,
+            '50%': 3,
+            '75%': 4,
+            'max': 4
+        },
+        'Residence_since': {
+            'count': 1000,
+            'mean': 2.840,
+            'std': 1.100,
+            'min': 1,
+            '25%': 2,
+            '50%': 3,
+            '75%': 4,
+            'max': 4
+        },
+        'Age': {
+            'count': 1000,
+            'mean': 35.550,
+            'std': 11.380,
+            'min': 19,
+            '25%': 27,
+            '50%': 33,
+            '75%': 42,
+            'max': 75
+        }
+    }
+
+    # Optional: Provide custom abbreviations
+    abbreviations = {
+        'Duration': 'Dur.',
+        'Amount': 'Amt.',
+        'Installment_rate': 'Inst.',
+        'Residence_since': 'Res.',
+        'Age': 'Age'
+    }
+
+    latex = generate_summary_statistics_table(
+        stats_data=stats_data,
+        caption="Summary statistics for german_credit_record",
+        label="tab:summary_stats_german",
+        column_abbreviations=abbreviations
+    )
+
+    return latex
+
+
+# =============================================================================
+# Example 2: SMOTE Class Distribution Comparison (Table 3 style)
+# =============================================================================
+
+def example_smote_comparison():
+    """Generate a SMOTE before/after comparison table."""
+
+    original_dist = {0: 700, 1: 300}
+    smote_dist = {0: 560, 1: 560}
+
+    latex = generate_smote_comparison_table(
+        original_dist=original_dist,
+        smote_dist=smote_dist,
+        caption="SMOTE class distribution comparison for german_credit_record",
+        label="tab:smote_german"
+    )
+
+    return latex
+
+
+# =============================================================================
+# Example 3: Feature Importance Table (Table 4 style)
+# =============================================================================
+
+def example_feature_importance():
+    """Generate a combined RF/LR feature importance table."""
+
+    features = [
+        {'feature': 'months_duration', 'rf_importance': 0.076, 'lr_coefficient': 1.983, 'average': 0.921},
+        {'feature': 'credit_amount', 'rf_importance': 0.090, 'lr_coefficient': 1.386, 'average': 0.849},
+        {'feature': 'checking_status: no checking account', 'rf_importance': 0.065, 'lr_coefficient': 1.130, 'average': 0.643},
+        {'feature': 'age', 'rf_importance': 0.073, 'lr_coefficient': 0.415, 'average': 0.508},
+        {'feature': 'credit_history: critical account / other credits existing', 'rf_importance': 0.026, 'lr_coefficient': 1.094, 'average': 0.418},
+        {'feature': 'installment_rate', 'rf_importance': 0.034, 'lr_coefficient': 0.756, 'average': 0.377},
+        {'feature': 'purpose: education', 'rf_importance': 0.011, 'lr_coefficient': 1.250, 'average': 0.371},
+        {'feature': 'savings_status: unknown / none', 'rf_importance': 0.018, 'lr_coefficient': 0.930, 'average': 0.328},
+        {'feature': 'checking_status: < 0 DM', 'rf_importance': 0.039, 'lr_coefficient': 0.424, 'average': 0.322},
+        {'feature': 'savings_status: < 100 DM', 'rf_importance': 0.007, 'lr_coefficient': 1.115, 'average': 0.316},
+        {'feature': 'foreign_worker: no', 'rf_importance': 0.004, 'lr_coefficient': 1.111, 'average': 0.296},
+        {'feature': 'existing_credits', 'rf_importance': 0.018, 'lr_coefficient': 0.720, 'average': 0.275},
+        {'feature': 'purpose: car (used)', 'rf_importance': 0.010, 'lr_coefficient': 0.850, 'average': 0.265},
+        {'feature': 'other_debtors_guarantors: none', 'rf_importance': 0.012, 'lr_coefficient': 0.677, 'average': 0.233},
+        {'feature': 'employment_since: 4 ≤ ... < 7 years', 'rf_importance': 0.012, 'lr_coefficient': 0.668, 'average': 0.228},
+        {'feature': 'purpose: others', 'rf_importance': 0.001, 'lr_coefficient': 0.875, 'average': 0.221},
+        {'feature': 'other_installment_plans: bank', 'rf_importance': 0.017, 'lr_coefficient': 0.478, 'average': 0.212},
+        {'feature': 'personal_status_sex: male, single', 'rf_importance': 0.017, 'lr_coefficient': 0.484, 'average': 0.209},
+        {'feature': 'savings_status: < 100 DM', 'rf_importance': 0.024, 'lr_coefficient': 0.272, 'average': 0.199},
+        {'feature': 'other_installment_plans: none', 'rf_importance': 0.018, 'lr_coefficient': 0.345, 'average': 0.184}
+    ]
+
+    latex = generate_feature_importance_table(
+        features=features,
+        caption="Top features by combined RF/LR importance for german_credit_record",
+        label="tab:fi_german",
+        max_features=20
+    )
+
+    return latex
+
+
+# =============================================================================
+# Example 4: Flexible Custom Table
+# =============================================================================
+
+def example_flexible_table():
+    """Generate a custom table with flexible formatting."""
+
+    data = [
+        {'Model': 'Logistic Regression', 'AUC': 0.7845, 'Accuracy': 0.7234, 'F1': 0.6891},
+        {'Model': 'Random Forest', 'AUC': 0.8123, 'Accuracy': 0.7654, 'F1': 0.7234},
+        {'Model': 'XGBoost', 'AUC': 0.8345, 'Accuracy': 0.7891, 'F1': 0.7567},
+        {'Model': 'Neural Network', 'AUC': 0.8201, 'Accuracy': 0.7723, 'F1': 0.7389}
+    ]
+
+    latex = generate_flexible_latex_table(
+        data=data,
+        caption="Model performance comparison",
+        label="tab:model_performance",
+        column_order=['Model', 'AUC', 'Accuracy', 'F1'],
+        column_labels={'Model': 'Model', 'AUC': 'AUC', 'Accuracy': 'Acc.', 'F1': 'F1'},
+        column_formats={'AUC': 'decimal:4', 'Accuracy': 'decimal:4', 'F1': 'decimal:4'},
+        size='footnotesize',
+        notes="All metrics evaluated on test set with 5-fold cross-validation."
+    )
+
+    return latex
+
+
+# =============================================================================
+# Complete Example: Generate All Tables
+# =============================================================================
+
+def generate_all_example_tables():
+    """Generate all example tables and combine them."""
+
+    latex_output = []
+
+    latex_output.append("% Summary Statistics Table")
+    latex_output.append(example_summary_statistics())
+    latex_output.append("")
+
+    latex_output.append("% SMOTE Comparison Table")
+    latex_output.append(example_smote_comparison())
+    latex_output.append("")
+
+    latex_output.append("% Feature Importance Table")
+    latex_output.append(example_feature_importance())
+    latex_output.append("")
+
+    latex_output.append("% Flexible Custom Table")
+    latex_output.append(example_flexible_table())
+    latex_output.append("")
+
+    return "\n".join(latex_output)
+
+
+if __name__ == "__main__":
+    # Generate and print all example tables
+    all_tables = generate_all_example_tables()
+    print(all_tables)
+
+    # Optionally save to file
+    with open("example_tables.tex", "w") as f:
+        f.write(all_tables)
+    print("\nTables saved to example_tables.tex")

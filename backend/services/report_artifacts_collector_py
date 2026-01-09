@@ -1,0 +1,225 @@
+"""
+Report Artifacts Collector.
+
+Aggregates all database artifacts for a given CSV dataset to support
+comprehensive report generation.
+
+Fetches: metadata, analysis results, feature importance, SHAP analysis,
+model results, and image paths.
+"""
+
+from typing import Dict, Any, List, Optional
+from persistence.dataset_repository import get_dataset_metadata, load_csv_data
+from persistence.analysis_repository import (
+    load_pandas_result,
+    load_image_path,
+    load_all_feature_importance_results,
+    load_smote_result
+)
+from persistence.shap_repository import load_shap_result
+from persistence.model_repository import get_model_run_details
+from persistence.label_randomization_repository import load_label_randomization_result
+from persistence.validated_commentary_repository import load_all_validated_commentaries
+from services.statistical_tests_service import get_statistical_test_results
+from datetime import datetime
+
+
+def _collect_pandas_results(filename: str) -> Dict[str, Any]:
+    """Collect all Pandas analysis results from database."""
+    results = {}
+
+    # Descriptive statistics
+    describe_data = load_pandas_result(filename, "describe")
+    if describe_data:
+        results['describe'] = describe_data
+
+    # Column summary
+    column_summary = load_pandas_result(filename, "column_summary")
+    if column_summary:
+        results['column_summary'] = column_summary
+
+    # Target distribution
+    target_dist = load_pandas_result(filename, "target_distribution")
+    if target_dist:
+        results['target_distribution'] = target_dist
+
+    return results
+
+
+def _collect_image_paths(filename: str) -> Dict[str, str]:
+    """Collect all image paths from database."""
+    paths = {}
+
+    image_types = [
+        'pairplot',
+        'correlation_heatmap',
+        'feature_importance',
+        'roc_curve',
+        'precision_recall_curve',
+        'shap_summary',
+        'class_distribution'
+    ]
+
+    for img_type in image_types:
+        path = load_image_path(filename, img_type)
+        if path:
+            paths[img_type] = path
+
+    return paths
+
+
+def _collect_feature_importance_results(filename: str) -> Dict[str, Any]:
+    """Collect all feature importance tables from database."""
+    return load_all_feature_importance_results(filename)
+
+
+def _collect_shap_results(filename: str) -> Dict[str, Any]:
+    """Collect SHAP analysis results from database."""
+    shap_data = load_shap_result(filename)
+    return shap_data if shap_data else {}
+
+
+def _collect_statistical_test_results(filename: str, run_timestamp: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    """Collect statistical test results from database."""
+    try:
+        results = get_statistical_test_results(filename, run_timestamp)
+        return results if results else []
+    except Exception as e:
+        print(f"Warning: Error collecting statistical test results: {str(e)}")
+        return []
+
+
+def _collect_label_randomization_results(filename: str) -> Dict[str, Any]:
+    """Collect label randomization test results from database."""
+    lr_data = load_label_randomization_result(filename)
+    return lr_data if lr_data else {}
+
+
+def _collect_validated_commentaries(filename: str) -> List[Dict[str, Any]]:
+    """Collect all validated commentaries from database."""
+    commentaries = load_all_validated_commentaries(filename)
+    return commentaries if commentaries else []
+
+
+def collect_all_artifacts(
+    filename: str,
+    timestamp: str
+) -> Dict[str, Any]:
+    """
+    Collect ALL database artifacts for comprehensive report generation.
+
+    Args:
+        filename: CSV dataset filename
+        timestamp: Model run timestamp (ISO format string)
+
+    Returns:
+        Dictionary containing all collected artifacts:
+        {
+            'run_data': {...},  # Model execution results
+            'dataset_metadata': {...},  # CSV metadata
+            'pandas_results': {...},  # Descriptive stats, distributions
+            'fi_results': {...},  # Feature importance tables
+            'shap_results': {...},  # SHAP analysis
+            'image_paths': {...},  # Image file paths
+            'smote_results': {...},  # SMOTE analysis (if applicable)
+            'statistical_tests': [...],  # Statistical significance tests
+        }
+    """
+    artifacts = {}
+
+    try:
+        # 1. Get model run details (all models, best models, benchmark)
+        run_data = get_model_run_details(filename, timestamp)
+        if run_data:
+            artifacts['run_data'] = run_data
+        else:
+            artifacts['run_data'] = {}
+
+        # 2. Get dataset metadata
+        dataset_metadata = get_dataset_metadata(filename)
+        artifacts['dataset_metadata'] = dataset_metadata if dataset_metadata else {}
+
+        # 3. Get Pandas analysis results
+        pandas_results = _collect_pandas_results(filename)
+        artifacts['pandas_results'] = pandas_results
+
+        # 4. Get feature importance results
+        fi_results = _collect_feature_importance_results(filename)
+        artifacts['fi_results'] = fi_results
+
+        # 5. Get SHAP analysis results
+        shap_results = _collect_shap_results(filename)
+        artifacts['shap_results'] = shap_results
+
+        # 6. Get image paths
+        image_paths = _collect_image_paths(filename)
+        artifacts['image_paths'] = image_paths
+
+        # 7. Get SMOTE results (if applicable)
+        smote_results = load_smote_result(filename)
+        artifacts['smote_results'] = smote_results if smote_results else {}
+
+        # 8. Get Dataset Quality Summary (Table X) if available
+        from persistence.dataset_repository import get_dataset_quality_summary
+        dataset_quality_summary = get_dataset_quality_summary(filename)
+        artifacts['dataset_quality_summary'] = dataset_quality_summary if dataset_quality_summary else []
+
+        # 9. Get Statistical Test Results
+        run_ts = datetime.fromisoformat(timestamp) if timestamp else None
+        statistical_tests = _collect_statistical_test_results(filename, run_ts)
+        artifacts['statistical_tests'] = statistical_tests
+
+        # 10. Get Label Randomization Results
+        label_randomization = _collect_label_randomization_results(filename)
+        artifacts['label_randomization'] = label_randomization
+
+        # 11. Get Validated Commentaries
+        validated_commentaries = _collect_validated_commentaries(filename)
+        artifacts['validated_commentaries'] = validated_commentaries
+
+        return artifacts
+
+    except Exception as e:
+        # Return partial artifacts on error
+        print(f"Warning: Error collecting artifacts for {filename}: {str(e)}")
+        return {
+            'run_data': run_data if 'run_data' in locals() else {},
+            'dataset_metadata': dataset_metadata if 'dataset_metadata' in locals() else {},
+            'pandas_results': pandas_results if 'pandas_results' in locals() else {},
+            'fi_results': fi_results if 'fi_results' in locals() else {},
+            'shap_results': shap_results if 'shap_results' in locals() else {},
+            'image_paths': image_paths if 'image_paths' in locals() else {},
+            'smote_results': {},
+            'dataset_quality_summary': [],
+            'statistical_tests': [],
+            'label_randomization': {},
+            'validated_commentaries': [],
+            'error': str(e)
+        }
+
+
+def collect_combined_artifacts(
+    run_ids: List[Dict[str, str]]
+) -> List[Dict[str, Any]]:
+    """
+    Collect all artifacts for multiple runs (for combined reports).
+
+    Args:
+        run_ids: List of dicts with 'filename' and 'timestamp' keys
+
+    Returns:
+        List of artifact dictionaries, one per run
+    """
+    all_artifacts = []
+
+    for run_id in run_ids:
+        filename = run_id.get('filename')
+        timestamp = run_id.get('timestamp')
+
+        if not filename or not timestamp:
+            continue
+
+        artifacts = collect_all_artifacts(filename, timestamp)
+        all_artifacts.append(artifacts)
+
+    return all_artifacts

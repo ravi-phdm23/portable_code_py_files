@@ -1,0 +1,319 @@
+"""
+Falsifiability-Driven Explanation Pipeline
+
+This module orchestrates the complete predictive-explanatory framework:
+1. Statistical Reliability Layer (Wilcoxon, McNemar, DeLong)
+2. Explanatory Validity Layer (Rank stability, Label randomization, Model sanity)
+3. GenAI Narrative Rendering (Only for validated explanations)
+
+The pipeline ensures that only empirically validated findings reach the
+narrative generation stage, maintaining alignment with Basel/EBA requirements.
+"""
+
+import numpy as np
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+
+from services.explanation_validator import (
+    ExplanationValidator,
+    ExplanationValidationReport,
+    format_validation_report_for_genai
+)
+from services.genai_narrative_renderer import (
+    GenAINarrativeRenderer,
+    CreditRiskNarrative
+)
+from services.statistical_tests_service import get_statistical_test_results
+
+
+class FalsifiabilityPipeline:
+    """
+    Complete pipeline from model predictions to validated narratives.
+
+    This class implements the three-layer architecture described in the paper:
+    Layer 1: Statistical reliability (predictive layer)
+    Layer 2: Explanatory validity (falsifiability layer)
+    Layer 3: Narrative rendering (GenAI layer - operates only on validated findings)
+    """
+
+    def __init__(
+        self,
+        validator_config: Optional[Dict[str, Any]] = None,
+        renderer_config: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Initialize the falsifiability pipeline.
+
+        Args:
+            validator_config: Configuration for explanation validator
+            renderer_config: Configuration for narrative renderer
+        """
+        self.validator = ExplanationValidator(validator_config)
+        self.renderer = GenAINarrativeRenderer(renderer_config)
+
+    def process_model_explanation(
+        self,
+        model_name: str,
+        dataset_filename: str,
+        run_timestamp: str,
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        base_value: float,
+        prediction: float,
+        dataset_info: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Tuple[ExplanationValidationReport, Optional[CreditRiskNarrative]]:
+        """
+        Process a model explanation through the complete falsifiability pipeline.
+
+        Args:
+            model_name: Name of the model being explained
+            dataset_filename: Dataset filename for retrieving statistical tests
+            run_timestamp: Run timestamp for retrieving statistical tests
+            shap_values: SHAP values for the prediction
+            feature_names: Names of features
+            base_value: SHAP base/expected value
+            prediction: Model prediction
+            dataset_info: Additional dataset metadata
+            **kwargs: Additional parameters for validation
+
+        Returns:
+            Tuple of (validation_report, narrative)
+            - validation_report: Always returned
+            - narrative: Only returned if explanation passes validation
+
+        Example:
+            >>> pipeline = FalsifiabilityPipeline()
+            >>> report, narrative = pipeline.process_model_explanation(
+            ...     model_name="RandomForest-10",
+            ...     dataset_filename="Australian Credit.csv",
+            ...     run_timestamp="2025-12-31T10:44:11.882658",
+            ...     shap_values=np.array([0.05, -0.03, 0.12, ...]),
+            ...     feature_names=["A8", "A5", "A14", ...],
+            ...     base_value=0.5,
+            ...     prediction=0.62
+            ... )
+            >>> if narrative:
+            ...     print("Explanation passed validation!")
+            ...     print(pipeline.renderer.export_narrative_to_text(narrative))
+        """
+        # Layer 1: Retrieve statistical reliability evidence
+        statistical_tests = get_statistical_test_results(
+            dataset_filename,
+            run_timestamp
+        )
+
+        # Layer 2: Validate explanation through falsification tests
+        validation_report = self.validator.validate_explanation(
+            model_name=model_name,
+            explanation_method="SHAP",
+            shap_values=shap_values,
+            feature_names=feature_names,
+            statistical_tests=statistical_tests,
+            base_prediction=base_value,
+            actual_prediction=prediction,
+            **kwargs
+        )
+
+        # Check if explanation passed validation
+        if not validation_report.validated_for_genai:
+            # Return validation report but no narrative
+            return validation_report, None
+
+        # Layer 3: Render validated findings into narrative
+        validated_findings = format_validation_report_for_genai(validation_report)
+
+        # Prepare SHAP summary for narrative
+        shap_summary = self._prepare_shap_summary(
+            shap_values, feature_names, base_value, prediction
+        )
+
+        # Prepare dataset info
+        if dataset_info is None:
+            dataset_info = {'filename': dataset_filename}
+
+        # Generate narrative
+        narrative = self.renderer.render_narrative(
+            validated_findings=validated_findings,
+            shap_summary=shap_summary,
+            dataset_info=dataset_info
+        )
+
+        return validation_report, narrative
+
+    def _prepare_shap_summary(
+        self,
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        base_value: float,
+        prediction: float
+    ) -> Dict[str, Any]:
+        """
+        Prepare SHAP summary for narrative rendering.
+
+        Args:
+            shap_values: SHAP attribution values
+            feature_names: Feature names
+            base_value: Base/expected value
+            prediction: Actual prediction
+
+        Returns:
+            Dictionary with SHAP summary information
+        """
+        # Calculate feature importances (absolute SHAP values)
+        abs_shap = np.abs(shap_values)
+
+        # Get top features by importance
+        sorted_indices = np.argsort(abs_shap)[::-1]
+
+        top_features = []
+        for idx in sorted_indices:
+            feature_info = {
+                'feature': feature_names[idx],
+                'importance': abs_shap[idx],
+                'shap_value': shap_values[idx],
+                'direction': 'positive' if shap_values[idx] > 0 else 'negative' if shap_values[idx] < 0 else 'neutral'
+            }
+            top_features.append(feature_info)
+
+        return {
+            'base_value': base_value,
+            'prediction': prediction,
+            'top_features': top_features,
+            'total_features': len(feature_names),
+            'shap_sum': np.sum(shap_values),
+            'expected_diff': prediction - base_value
+        }
+
+    def generate_latex_section(
+        self,
+        narrative: CreditRiskNarrative
+    ) -> str:
+        """
+        Generate LaTeX section for validated narrative.
+
+        This can be included in comprehensive reports.
+
+        Args:
+            narrative: Generated narrative
+
+        Returns:
+            LaTeX code for narrative section
+        """
+        return self.renderer.export_narrative_to_latex(narrative)
+
+    def export_narrative_text(
+        self,
+        narrative: CreditRiskNarrative
+    ) -> str:
+        """
+        Export narrative to plain text.
+
+        Args:
+            narrative: Generated narrative
+
+        Returns:
+            Plain text version of narrative
+        """
+        return self.renderer.export_narrative_to_text(narrative)
+
+
+def create_falsifiability_report(
+    model_name: str,
+    dataset_filename: str,
+    run_timestamp: str,
+    shap_results: Dict[str, Any],
+    dataset_info: Optional[Dict[str, Any]] = None,
+    save_to_file: bool = False,
+    output_dir: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Convenience function to create a complete falsifiability report.
+
+    This function is designed to be called from API endpoints or scripts.
+
+    Args:
+        model_name: Name of the model
+        dataset_filename: Dataset filename
+        run_timestamp: Run timestamp
+        shap_results: SHAP analysis results (must include 'shap_values', 'feature_names', etc.)
+        dataset_info: Optional dataset metadata
+        save_to_file: Whether to save report to file
+        output_dir: Directory to save report (if save_to_file=True)
+
+    Returns:
+        Dictionary containing:
+        - validation_report: Validation results
+        - narrative: Generated narrative (if validated)
+        - latex_section: LaTeX version (if validated)
+        - text_export: Plain text version (if validated)
+        - saved_path: Path to saved file (if save_to_file=True)
+    """
+    # Extract SHAP components
+    shap_values = np.array(shap_results['shap_values'])
+    feature_names = shap_results['feature_names']
+    base_value = shap_results.get('base_value', 0.0)
+    prediction = shap_results.get('prediction', 0.0)
+
+    # Create pipeline
+    pipeline = FalsifiabilityPipeline()
+
+    # Process explanation
+    validation_report, narrative = pipeline.process_model_explanation(
+        model_name=model_name,
+        dataset_filename=dataset_filename,
+        run_timestamp=run_timestamp,
+        shap_values=shap_values,
+        feature_names=feature_names,
+        base_value=base_value,
+        prediction=prediction,
+        dataset_info=dataset_info
+    )
+
+    # Build response
+    response = {
+        'validation_report': {
+            'model_name': validation_report.model_name,
+            'validated': validation_report.validated_for_genai,
+            'tests_passed': validation_report.passed_tests,
+            'tests_failed': validation_report.failed_tests,
+            'confidence': validation_report.passed_tests / max(1, validation_report.falsification_attempts),
+            'timestamp': validation_report.validation_timestamp
+        },
+        'narrative': None,
+        'latex_section': None,
+        'text_export': None
+    }
+
+    # If validated, add narrative outputs
+    if narrative:
+        response['narrative'] = {
+            'executive_summary': narrative.executive_summary.content,
+            'sections': {
+                'statistical_evidence': narrative.statistical_evidence.content,
+                'model_reasoning': narrative.model_reasoning.content,
+                'risk_assessment': narrative.risk_assessment.content,
+                'regulatory_compliance': narrative.regulatory_compliance.content
+            }
+        }
+        response['latex_section'] = pipeline.generate_latex_section(narrative)
+        response['text_export'] = pipeline.export_narrative_text(narrative)
+
+        # Save to file if requested
+        if save_to_file:
+            import os
+            if output_dir is None:
+                output_dir = os.path.join('backend', 'outputs', 'narratives')
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"narrative_{model_name}_{timestamp_str}.txt"
+            filepath = os.path.join(output_dir, filename)
+
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(response['text_export'])
+
+            response['saved_path'] = filepath
+
+    return response

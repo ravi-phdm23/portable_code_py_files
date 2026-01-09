@@ -1,0 +1,836 @@
+"""
+SHAP Analysis Service.
+Provides SHAP-based model explanations, reliability metrics, and counterfactual analysis.
+"""
+
+import hashlib
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import shap
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.utils import check_random_state
+import os
+import json
+from datetime import datetime
+
+from config import get_images_dir
+
+# Initialize SHAP (only for Jupyter notebooks, skip in backend)
+# shap.initjs()  # Commented out - not needed for backend API
+
+
+# --- Helper Functions ---
+
+def _stratified_sample(X: pd.DataFrame, y: pd.Series, n_samples: int, random_state: int):
+    """Return a stratified sample of X (and y) with at most n_samples rows."""
+    n_samples = min(n_samples, len(X))
+    if n_samples == len(X):
+        return X.copy(), y.copy()
+
+    splitter = StratifiedShuffleSplit(
+        n_splits=1, test_size=n_samples, random_state=random_state
+    )
+    idx_train, idx_sample = next(splitter.split(X, y))
+    return X.iloc[idx_sample].copy(), y.iloc[idx_sample].copy()
+
+
+def _split_pipeline(model):
+    """Return (preprocess, estimator) whether model is a Pipeline or bare estimator."""
+    if isinstance(model, Pipeline):
+        preprocess = model[:-1]
+        estimator = model[-1]
+    else:
+        preprocess = None
+        estimator = model
+    return preprocess, estimator
+
+
+def _to_numeric_matrix(data):
+    """Best-effort conversion to a dense numeric matrix for SHAP."""
+    if hasattr(data, "toarray"):
+        data = data.toarray()
+    try:
+        df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+        df = df.apply(pd.to_numeric, errors="coerce")
+        return df.to_numpy(dtype=np.float64, copy=False)
+    except Exception:
+        arr = np.asarray(data)
+        if arr.dtype.kind == "O":
+            try:
+                arr = arr.astype(np.float64)
+            except Exception:
+                pass
+        return arr
+
+
+def _transform_data_for_explainer(model, data):
+    """
+    Robust version for SHAP:
+    - Always returns a numeric DataFrame (float64)
+    - Converts object/categorical columns to factorized integer codes
+    """
+    if not isinstance(data, pd.DataFrame):
+        try:
+            data = pd.DataFrame(data)
+        except Exception:
+            data = pd.DataFrame(np.asarray(data))
+
+    df = data.copy()
+
+    for col in df.columns:
+        if df[col].dtype == "object" or str(df[col].dtype).startswith("category"):
+            try:
+                str_values = df[col].astype(str)
+                categories = sorted(str_values.unique())
+                cat_encoded = pd.Categorical(str_values, categories=categories).codes
+                df[col] = cat_encoded
+            except Exception:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.apply(pd.to_numeric, errors="coerce")
+    return df.astype(np.float64)
+
+
+def _coerce_df_to_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert a DataFrame to numeric columns for SHAP plotting."""
+    out = df.copy()
+    for col in out.columns:
+        if not pd.api.types.is_numeric_dtype(out[col]):
+            try:
+                codes, _ = pd.factorize(out[col].astype(str))
+                out[col] = codes
+            except Exception:
+                out[col] = pd.to_numeric(out[col], errors="coerce")
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
+
+
+def _p1_wrapper(model, feature_names):
+    """Returns f(X) -> P(class=1) for SHAP."""
+    preprocess, estimator = _split_pipeline(model)
+    raw_dim = len(feature_names)
+
+    def predict_proba_p1(data):
+        if isinstance(data, pd.DataFrame):
+            try:
+                return model.predict_proba(data[feature_names])[:, 1]
+            except Exception:
+                try:
+                    return model.predict_proba(data)[:, 1]
+                except Exception:
+                    pass
+
+        arr = _to_numeric_matrix(data)
+        n_features = arr.shape[1] if hasattr(arr, "shape") else None
+
+        if n_features == raw_dim:
+            try:
+                df = pd.DataFrame(arr, columns=feature_names)
+                return model.predict_proba(df)[:, 1]
+            except Exception:
+                pass
+
+        if estimator is not None and preprocess is not None and n_features is not None:
+            try:
+                return estimator.predict_proba(arr)[:, 1]
+            except Exception:
+                pass
+
+        return model.predict_proba(arr)[:, 1]
+
+    return predict_proba_p1
+
+
+def _infer_feature_names(preprocess, raw_feature_names, n_features):
+    """Best-effort retrieval of feature names after preprocessing."""
+    if preprocess is not None:
+        for getter in (
+            lambda: preprocess.get_feature_names_out(raw_feature_names),
+            lambda: preprocess.get_feature_names_out(),
+        ):
+            try:
+                names = list(getter())
+                if len(names) == n_features:
+                    return names
+            except Exception:
+                pass
+
+    if len(raw_feature_names) == n_features:
+        return list(raw_feature_names)
+
+    return [f"feature_{i}" for i in range(n_features)]
+
+
+def _hash_model_and_bg(model, background_df: pd.DataFrame) -> str:
+    """Hash of the model plus background shape/content for caching."""
+    h = hashlib.sha1()
+    h.update(str(model).encode("utf-8"))
+    h.update(str(background_df.shape).encode("utf-8"))
+    try:
+        sample = background_df.head(5).to_csv(index=False).encode("utf-8")
+        h.update(sample)
+    except Exception:
+        pass
+    return h.hexdigest()
+
+
+def _make_explainer(model, background_df, feature_names):
+    """Build a SHAP explainer that is robust to sklearn Pipelines."""
+    preprocess, estimator = _split_pipeline(model)
+    X_bg_raw = _transform_data_for_explainer(model, background_df)
+
+    try:
+        from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+
+        tree_model_types = (RandomForestClassifier, GradientBoostingClassifier)
+
+        if preprocess is None and isinstance(estimator, tree_model_types):
+            X_bg_num = _to_numeric_matrix(X_bg_raw)
+            return shap.TreeExplainer(estimator, X_bg_num, feature_names=feature_names)
+
+        f_p1 = _p1_wrapper(model, feature_names)
+        return shap.Explainer(f_p1, X_bg_raw, feature_names=feature_names)
+
+    except Exception as e:
+        import warnings
+        warnings.warn(f"SHAP explainer creation failed: {e}. Falling back to KernelExplainer.")
+        f_p1 = _p1_wrapper(model, feature_names)
+        return shap.KernelExplainer(f_p1, X_bg_raw)
+
+
+# --- Main SHAP Analysis Functions ---
+
+def train_model_for_shap(df: pd.DataFrame, selected_features: List[str], target_column: str = 'target', use_smote: bool = False) -> Tuple[Pipeline, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """
+    Train a logistic regression model and return the pipeline along with train/test splits.
+
+    Args:
+        df: DataFrame with all columns
+        selected_features: List of feature column names
+        target_column: Name of target column
+        use_smote: Whether to apply SMOTE to training data
+
+    Returns:
+        Tuple of (model, X_train, X_test, y_train, y_test)
+    """
+    X = df[selected_features].copy()
+    y = df[target_column].copy()
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, stratify=y, random_state=42
+    )
+
+    numeric_cols = X.select_dtypes(include=['number']).columns.tolist()
+    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    for col in categorical_cols:
+        X_train[col] = X_train[col].astype(str)
+        X_test[col] = X_test[col].astype(str)
+
+    numeric_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+
+    categorical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_pipeline, numeric_cols),
+            ('cat', categorical_pipeline, categorical_cols)
+        ]
+    )
+
+    model = Pipeline([
+        ('preprocessor', preprocessor),
+        ('classifier', LogisticRegression(C=1.0, max_iter=2000, random_state=42))
+    ])
+
+    # Apply SMOTE if requested
+    if use_smote:
+        try:
+            from imblearn.over_sampling import SMOTE
+            # Transform features for SMOTE
+            X_train_transformed = model.named_steps['preprocessor'].fit_transform(X_train)
+
+            # Apply SMOTE
+            smote = SMOTE(random_state=42)
+            X_train_resampled, y_train_resampled = smote.fit_resample(X_train_transformed, y_train)
+
+            # Train only the classifier on SMOTE-resampled data
+            model.named_steps['classifier'].fit(X_train_resampled, y_train_resampled)
+        except ImportError:
+            # If SMOTE not available, fall back to normal training
+            model.fit(X_train, y_train)
+    else:
+        model.fit(X_train, y_train)
+
+    return model, X_train, X_test, y_train, y_test
+
+
+def get_shap_values(model: Pipeline, X_train: pd.DataFrame, X_test: pd.DataFrame,
+                    max_bg: int = 50, max_explain: int = 50):
+    """
+    GLOBAL SHAP for a sample of test points.
+    
+    Returns:
+        shap_values: shap.Explanation or array
+        explain_df: DataFrame used for explanation
+        shap_global_df: DataFrame with [rank, feature, abs_mean_shap, mean_shap, std_shap]
+    """
+    preprocess, _ = _split_pipeline(model)
+    feature_names = X_train.columns.tolist()
+
+    background_df = shap.sample(X_train, min(max_bg, len(X_train)), random_state=42)
+    explain_df = shap.sample(X_test, min(max_explain, len(X_test)), random_state=42)
+
+    explainer = _make_explainer(model, background_df, feature_names)
+    explain_data = _transform_data_for_explainer(model, explain_df)
+    sv = explainer(explain_data)
+
+    if isinstance(sv, shap._explanation.Explanation):
+        V = np.asarray(sv.values)
+    else:
+        V = np.asarray(sv)
+
+    feature_names_used = feature_names if V.shape[1] == len(feature_names) else _infer_feature_names(preprocess, feature_names, V.shape[1])
+
+    try:
+        explain_df_for_plot = pd.DataFrame(explain_data, columns=feature_names_used)
+    except Exception:
+        explain_df_for_plot = explain_df
+    explain_df_for_plot = _coerce_df_to_numeric(explain_df_for_plot).apply(pd.to_numeric, errors="coerce")
+
+    abs_mean = np.mean(np.abs(V), axis=0)
+    mean_signed = np.mean(V, axis=0)
+    std = np.std(V, axis=0)
+
+    shap_global_df = (
+        pd.DataFrame({
+            "feature": feature_names_used,
+            "abs_mean_shap": abs_mean,
+            "mean_shap": mean_signed,
+            "std_shap": std
+        })
+        .sort_values("abs_mean_shap", ascending=False, kind="mergesort")
+        .reset_index(drop=True)
+    )
+    shap_global_df.insert(0, "rank", np.arange(1, len(shap_global_df) + 1))
+    shap_global_df["abs_mean"] = shap_global_df["abs_mean_shap"]
+
+    if isinstance(sv, shap._explanation.Explanation):
+        try:
+            sv = shap.Explanation(
+                values=sv.values,
+                base_values=sv.base_values,
+                data=explain_df_for_plot.to_numpy(dtype=float, copy=False),
+                feature_names=feature_names_used,
+            )
+        except Exception:
+            pass
+
+    return sv, explain_df_for_plot, shap_global_df
+
+
+def shap_rank_stability(model, X_train: pd.DataFrame, X_test: pd.DataFrame,
+                        n_bg_samples: int = 20, n_trials: int = 5,
+                        random_state: int = 42) -> pd.DataFrame:
+    """
+    Compute SHAP rank stability across multiple resamples.
+    
+    Returns:
+        DataFrame with columns [feature, avg_rank, std_rank] sorted by avg_rank.
+    """
+    rng = check_random_state(random_state)
+    preprocess, _ = _split_pipeline(model)
+    results = []
+    feature_names = X_train.columns.tolist()
+    feature_names_final = None
+
+    for _ in range(n_trials):
+        bg = X_train.sample(min(n_bg_samples, len(X_train)), random_state=rng.randint(1e9))
+        explainer = _make_explainer(model, bg, feature_names)
+        X_test_sample = X_test.sample(min(512, len(X_test)), random_state=rng.randint(1e9))
+        sv = explainer(_transform_data_for_explainer(model, X_test_sample))
+
+        V = np.asarray(sv.values) if hasattr(sv, "values") else np.asarray(sv)
+        abs_mean = np.abs(V).mean(axis=0)
+
+        feature_names_final = _infer_feature_names(preprocess, feature_names, V.shape[1])
+
+        order = np.argsort(abs_mean)[::-1]
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(1, len(order) + 1)
+        results.append(ranks)
+
+    ranks_mat = np.vstack(results)
+    n = min(ranks_mat.shape[1], len(feature_names_final))
+    ranks_mat = ranks_mat[:, :n]
+    features = feature_names_final[:n]
+
+    return pd.DataFrame({
+        "feature": features,
+        "avg_rank": ranks_mat.mean(axis=0),
+        "std_rank": ranks_mat.std(axis=0)
+    }).sort_values("avg_rank")
+
+
+def model_randomization_sanity(model, X_train: pd.DataFrame, X_test: pd.DataFrame,
+                               y_train: pd.Series, n_bg_samples: int = 20,
+                               random_state: int = 42) -> float:
+    """Return ratio: SHAP mass(original) / SHAP mass(randomized). Expect >> 1 if sane."""
+    if not isinstance(y_train, pd.Series):
+        y_train = pd.Series(y_train)
+
+    feature_names = X_train.columns.tolist()
+    bg = X_train.sample(min(n_bg_samples, len(X_train)), random_state=random_state)
+    explainer = _make_explainer(model, bg, feature_names)
+    sv = explainer(_transform_data_for_explainer(model, X_test))
+    V1 = np.asarray(sv.values) if hasattr(sv, "values") else np.asarray(sv)
+    mass_orig = np.abs(V1).mean()
+
+    try:
+        import sklearn.base as skbase
+        m2 = skbase.clone(model)
+    except Exception:
+        m2 = model
+
+    shuffled_idx = np.random.RandomState(random_state).permutation(len(X_train))
+    X_rand = X_train.iloc[shuffled_idx].reset_index(drop=True)
+    y_rand = y_train.iloc[shuffled_idx].reset_index(drop=True)
+
+    m2.fit(X_rand, y_rand)
+    explainer2 = _make_explainer(m2, bg, feature_names)
+    sv2 = explainer2(_transform_data_for_explainer(m2, X_test))
+    V2 = np.asarray(sv2.values) if hasattr(sv2, "values") else np.asarray(sv2)
+    mass_rand = np.abs(V2).mean()
+
+    return float(mass_orig / (mass_rand + 1e-12))
+
+
+def compute_shap_direction(shap_global_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns DataFrame with [feature, sign] where sign in {-1, 0, 1}
+    is the sign of the mean SHAP value.
+    """
+    return pd.DataFrame({
+        "feature": shap_global_df["feature"].values,
+        "sign": np.sign(shap_global_df["mean_shap"].values).astype(int)
+    })
+
+
+def summarize_reliability(df: pd.DataFrame, sanity_ratio: float, n_trials: int, bg_size: int) -> str:
+    """Produce a short textual summary of SHAP reliability checks."""
+    if df is None or df.empty:
+        return f"No feature ranking data available. Ran {n_trials} trials with background size {bg_size}."
+
+    working = df.copy()
+    working = working.sort_values("avg_rank", ascending=True).reset_index(drop=True)
+    top_k = min(3, len(working))
+    top_df = working.iloc[:top_k]
+    top_features = top_df["feature"].astype(str).tolist()
+
+    stds = top_df["std_rank"].fillna(float("inf"))
+    if (stds <= 0.05).all():
+        top_desc = "maintained identical ranks across all trials"
+    elif (stds <= 0.3).all():
+        top_desc = "showed very small rank variation"
+    else:
+        top_desc = "showed some rank variation but remained consistently among the most important features"
+
+    remaining = working.iloc[top_k:]
+    if remaining.empty:
+        stable_count = moderate_count = unstable_count = 0
+    else:
+        rem_stds = remaining["std_rank"].fillna(float("inf"))
+        stable_count = int((rem_stds < 0.5).sum())
+        moderate_count = int(((rem_stds >= 0.5) & (rem_stds < 1.0)).sum())
+        unstable_count = int((rem_stds >= 1.0).sum())
+
+    if sanity_ratio >= 0.95:
+        sanity_phrase = "indicates that the explanations are driven by genuine model–data structure rather than noise."
+    elif sanity_ratio >= 0.85:
+        sanity_phrase = "suggests that the explanations capture useful structure, although some noise is present."
+    else:
+        sanity_phrase = "raises concerns that the explanations may be dominated by noise."
+
+    if len(top_features) == 1:
+        top_list_str = top_features[0]
+    elif len(top_features) == 2:
+        top_list_str = f"{top_features[0]} and {top_features[1]}"
+    else:
+        top_list_str = ", ".join(top_features[:-1]) + f", and {top_features[-1]}"
+
+    para1 = (
+        f"Using {n_trials} trials and a background size of {bg_size}, the top {top_k} feature(s) by average rank were: {top_list_str}. "
+        f"These {('features' if top_k > 1 else 'feature')} {top_desc}."
+    )
+
+    remaining_count = len(working) - top_k
+    para2 = (
+        f"Among the remaining {remaining_count} feature(s), {stable_count} were stable, "
+        f"{moderate_count} showed moderate variation, and {unstable_count} exhibited unstable rankings. "
+        f"The sanity ratio of {sanity_ratio:.2f} {sanity_phrase}"
+    )
+
+    if sanity_ratio >= 0.95 and unstable_count == 0:
+        conclusion = "The SHAP explanations are stable and suitable for global interpretation."
+    elif sanity_ratio >= 0.85:
+        conclusion = "These results suggest reasonable reliability but some caution is warranted."
+    else:
+        conclusion = "Consider running more trials or increasing the background size before relying on these explanations."
+
+    return f"{para1}\n\n{para2}\n\n{conclusion}"
+
+
+def generate_shap_summary_plot(shap_values, explain_df: pd.DataFrame, filename: str) -> str:
+    """Generate and save SHAP summary plot."""
+    os.makedirs(get_images_dir(), exist_ok=True)
+    safe_filename = filename.replace('.csv', '')
+    plot_path = f"{get_images_dir()}/{safe_filename}_shap_summary.png"
+
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values, explain_df, show=False, max_display=20)
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return f"/images/{safe_filename}_shap_summary.png"
+
+
+def generate_shap_bar_plot(shap_values, explain_df: pd.DataFrame, filename: str) -> str:
+    """Generate and save SHAP bar plot (mean absolute values)."""
+    os.makedirs(get_images_dir(), exist_ok=True)
+    safe_filename = filename.replace('.csv', '')
+    plot_path = f"{get_images_dir()}/{safe_filename}_shap_bar.png"
+
+    plt.figure(figsize=(10, 8))
+    shap.plots.bar(shap_values, show=False, max_display=20)
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return f"/images/{safe_filename}_shap_bar.png"
+
+
+def _run_single_shap_analysis(model, X_train: pd.DataFrame, X_test: pd.DataFrame, y_train: pd.Series, filename: str, n_trials: int, bg_size: int, selected_features: List[str], model_info: Dict[str, Any], generate_plots: bool = True) -> Dict[str, Any]:
+    """Helper function to run SHAP analysis for a single model."""
+    # Get global SHAP values
+    shap_values, explain_df, shap_global_df = get_shap_values(model, X_train, X_test)
+
+    # Compute rank stability
+    stability_df = shap_rank_stability(model, X_train, X_test, n_bg_samples=bg_size, n_trials=n_trials)
+
+    # Compute sanity ratio
+    sanity_ratio = model_randomization_sanity(model, X_train, X_test, y_train, n_bg_samples=bg_size)
+
+    # Generate reliability summary
+    reliability_summary = summarize_reliability(stability_df, sanity_ratio, n_trials, bg_size)
+
+    # Compute direction
+    direction_df = compute_shap_direction(shap_global_df)
+
+    # Clean feature names in stability_df (remove prefixes like 'num__', 'cat__')
+    def clean_feature_name(name):
+        if isinstance(name, str):
+            # Remove common sklearn prefixes
+            for prefix in ['num__', 'cat__', 'remainder__']:
+                if name.startswith(prefix):
+                    return name[len(prefix):]
+        return name
+    
+    stability_df_clean = stability_df.copy()
+    stability_df_clean['feature'] = stability_df_clean['feature'].apply(clean_feature_name)
+
+    # Merge stability into global importance
+    merged_df = shap_global_df.merge(stability_df_clean[['feature', 'avg_rank', 'std_rank']], on='feature', how='left')
+    merged_df = merged_df.merge(direction_df, on='feature', how='left')
+    
+    # Replace NaN values with None for JSON serialization
+    merged_df = merged_df.where(pd.notnull(merged_df), None)
+    stability_df_clean = stability_df_clean.where(pd.notnull(stability_df_clean), None)
+
+    # Convert to records, handling NaN
+    def safe_to_dict(df):
+        records = df.to_dict(orient='records')
+        # Replace any remaining NaN/inf values
+        for record in records:
+            for key, value in record.items():
+                if pd.isna(value) or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
+                    record[key] = None
+        return records
+
+    result = {
+        "global_importance": safe_to_dict(merged_df),
+        "stability": safe_to_dict(stability_df_clean),
+        "sanity_ratio": float(sanity_ratio) if not np.isnan(sanity_ratio) else 1.0,
+        "reliability_summary": reliability_summary,
+        "direction": safe_to_dict(direction_df),
+        "model_info": model_info,
+        "metadata": {
+            "n_trials": n_trials,
+            "bg_size": bg_size,
+            "n_features": len(selected_features),
+            "timestamp": datetime.now().isoformat()
+        }
+    }
+
+    if generate_plots:
+        # Generate plots
+        summary_plot_path = generate_shap_summary_plot(shap_values, explain_df, filename)
+        bar_plot_path = generate_shap_bar_plot(shap_values, explain_df, filename)
+        result["plots"] = {
+            "summary_plot": summary_plot_path,
+            "bar_plot": bar_plot_path
+        }
+
+    return result, shap_values, explain_df
+
+
+def run_shap_analysis(df: pd.DataFrame, selected_features: List[str], filename: str,
+                      target_column: str = 'target', n_trials: int = 5, bg_size: int = 20, use_smote: bool = False,
+                      model: Optional[Pipeline] = None, run_timestamp: Optional[str] = None, model_timestamps: Optional[List[str]] = None,
+                      model_selections: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
+    """
+    Main entry point for SHAP analysis.
+
+    Args:
+        df: DataFrame with all columns
+        selected_features: List of feature column names
+        filename: Dataset filename (for saving plots)
+        target_column: Name of target column
+        n_trials: Number of trials for stability analysis
+        bg_size: Background sample size
+        use_smote: Whether to apply SMOTE during model training (only if model not provided)
+        model: Optional pre-trained model to explain (if None, will load or train)
+        run_timestamp: Optional timestamp to load best model from specific run
+        model_timestamps: Optional list of timestamps to load multiple models for analysis
+        model_selections: Optional list of dicts with {model_name, run_timestamp} for multi-model analysis
+
+    Returns:
+        If model_selections is provided, returns dictionary with:
+        - multi_model: True
+        - best_model: SHAP results for the best model (highest test_auc)
+        - all_models: List of SHAP results for all selected models
+        - model_count: Number of models analyzed
+        If model_timestamps is provided, returns dictionary with:
+        - best_model_results: SHAP results for the best model (highest test_auc)
+        - all_model_results: List of SHAP results for all loaded models
+        Otherwise, returns single model results dictionary with:
+        - global_importance: Feature importance table
+        - stability: Rank stability metrics
+        - sanity_ratio: Model randomization sanity ratio
+        - reliability_summary: Textual summary
+        - direction: Feature direction (positive/negative impact)
+        - plots: Paths to generated plots
+        - model_info: Information about which model was used
+    """
+    # Prepare data splits
+    X = df[selected_features].copy()
+    y = df[target_column].copy()
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, stratify=y, random_state=42
+    )
+
+    # NEW: Multi-model selection by name and timestamp
+    if model_selections is not None and len(model_selections) > 0:
+        from services.model_persistence import load_model_by_name
+        from persistence.model_repository import load_model_results
+
+        all_results = []
+        best_auc = -1
+        best_result = None
+        best_shap_values = None
+        best_explain_df = None
+
+        for selection in model_selections:
+            model_name = selection.get('model_name')
+            run_timestamp = selection.get('run_timestamp')
+
+            if not model_name or not run_timestamp:
+                print(f"Invalid selection: {selection}")
+                continue
+
+            # Get metadata for this model
+            results = load_model_results(filename)
+            metadata = next((r for r in results
+                           if r['model_name'] == model_name
+                           and r['timestamp'] == run_timestamp), None)
+
+            if not metadata:
+                print(f"Metadata not found for {model_name} at {run_timestamp}")
+                continue
+
+            # Load the model
+            model = load_model_by_name(filename, model_name, run_timestamp)
+            if not model:
+                print(f"Could not load model {model_name}")
+                continue
+
+            # Build model_info
+            model_info = {
+                'source': 'loaded_multi',
+                'model_name': metadata['model_name'],
+                'model_group': metadata.get('model_group'),
+                'run_timestamp': metadata['timestamp'],
+                'metrics': metadata['metrics']
+            }
+
+            # Run SHAP analysis for this model
+            single_result, shap_values, explain_df = _run_single_shap_analysis(
+                model, X_train, X_test, y_train, filename,
+                n_trials, bg_size, selected_features, model_info,
+                generate_plots=False  # Don't generate plots yet
+            )
+
+            all_results.append(single_result)
+
+            # Track best model by AUC
+            auc = metadata['metrics'].get('test_auc', 0)
+            if auc > best_auc:
+                best_auc = auc
+                best_result = single_result
+                best_shap_values = shap_values
+                best_explain_df = explain_df
+
+        if not all_results:
+            # Fallback to default behavior
+            print("No models loaded from selections, falling back to best model logic")
+            model_selections = None
+        else:
+            # Generate plots ONLY for best model
+            summary_plot_path = generate_shap_summary_plot(best_shap_values, best_explain_df, filename)
+            bar_plot_path = generate_shap_bar_plot(best_shap_values, best_explain_df, filename)
+            best_result["plots"] = {
+                "summary_plot": summary_plot_path,
+                "bar_plot": bar_plot_path
+            }
+
+            # Return multi-model structure
+            return {
+                "multi_model": True,
+                "best_model": best_result,
+                "all_models": all_results,
+                "model_count": len(all_results)
+            }
+
+    # Existing logic for model_timestamps
+    if model_timestamps is not None:
+        # Multiple models
+        from services.model_persistence import get_best_model_for_dataset
+        all_results = []
+        best_auc = -1
+        best_result = None
+        best_shap_values = None
+        best_explain_df = None
+        for ts in model_timestamps:
+            result = get_best_model_for_dataset(filename, ts)
+            if result:
+                model, metadata = result
+                print(f"Loaded model for SHAP: {metadata['model_name']} (AUC={metadata['metrics'].get('test_auc', 'N/A')})")
+                model_info = {
+                    'source': 'loaded_from_run',
+                    'model_name': metadata['model_name'],
+                    'model_group': metadata.get('model_group'),
+                    'run_timestamp': metadata['timestamp'],
+                    'metrics': metadata['metrics']
+                }
+                single_result, shap_values, explain_df = _run_single_shap_analysis(model, X_train, X_test, y_train, filename, n_trials, bg_size, selected_features, model_info, generate_plots=False)
+                all_results.append(single_result)
+                auc = metadata['metrics'].get('test_auc', 0)
+                if auc > best_auc:
+                    best_auc = auc
+                    best_result = single_result
+                    best_shap_values = shap_values
+                    best_explain_df = explain_df
+            else:
+                print(f"Could not load model for timestamp {ts}")
+        if all_results:
+            # Generate plots for best
+            summary_plot_path = generate_shap_summary_plot(best_shap_values, best_explain_df, filename)
+            bar_plot_path = generate_shap_bar_plot(best_shap_values, best_explain_df, filename)
+            best_result["plots"] = {
+                "summary_plot": summary_plot_path,
+                "bar_plot": bar_plot_path
+            }
+            return {
+                "best_model_results": best_result,
+                "all_model_results": all_results
+            }
+        else:
+            # Fallback to single model logic
+            print("No models loaded from timestamps, falling back to single model logic")
+            model_timestamps = None
+
+    # Single model logic
+    model_info = {}
+    if model is not None:
+        # Use provided model
+        print("Using provided model for SHAP analysis")
+        model_info = {
+            'source': 'provided',
+            'model_type': type(model).__name__
+        }
+    elif run_timestamp is not None:
+        # Load best model from specified run
+        from services.model_persistence import get_best_model_for_dataset
+        result = get_best_model_for_dataset(filename, run_timestamp)
+        if result:
+            model, metadata = result
+            print(f"Loaded best model: {metadata['model_name']} (AUC={metadata['metrics'].get('test_auc', 'N/A')})")
+            model_info = {
+                'source': 'loaded_from_run',
+                'model_name': metadata['model_name'],
+                'model_group': metadata.get('model_group'),
+                'run_timestamp': metadata['timestamp'],
+                'metrics': metadata['metrics']
+            }
+        else:
+            print(f"Could not load model from run {run_timestamp}, training new Logistic Regression")
+            model, X_train, X_test, y_train, y_test = train_model_for_shap(df, selected_features, target_column, use_smote)
+            model_info = {
+                'source': 'trained_fallback',
+                'model_type': 'Logistic Regression',
+                'reason': 'Could not load saved model'
+            }
+    else:
+        # Try to load most recent best model
+        from services.model_persistence import get_best_model_for_dataset
+        result = get_best_model_for_dataset(filename)
+        if result:
+            model, metadata = result
+            print(f"Loaded best model from most recent run: {metadata['model_name']}")
+            model_info = {
+                'source': 'loaded_best',
+                'model_name': metadata['model_name'],
+                'model_group': metadata.get('model_group'),
+                'run_timestamp': metadata['timestamp'],
+                'metrics': metadata['metrics']
+            }
+        else:
+            # Train new model (fallback)
+            print("No saved models found, training new Logistic Regression for SHAP analysis")
+            model, X_train, X_test, y_train, y_test = train_model_for_shap(df, selected_features, target_column, use_smote)
+            model_info = {
+                'source': 'trained_new',
+                'model_type': 'Logistic Regression'
+            }
+
+    # Run single analysis
+    result, _, _ = _run_single_shap_analysis(model, X_train, X_test, y_train, filename, n_trials, bg_size, selected_features, model_info, generate_plots=True)
+    return result

@@ -1,0 +1,552 @@
+"""
+Model Registry - Defines available model groups and variants.
+
+This registry maps human-readable model names to sklearn configurations.
+Each model group contains one or more model variants with clear, descriptive names.
+"""
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    AdaBoostClassifier,
+    BaggingClassifier,
+    GradientBoostingClassifier
+)
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.neighbors import KNeighborsClassifier
+
+# Model Registry Structure:
+# {
+#   "Model Group Name": {
+#     "Model Variant Name": {
+#       "model_class": sklearn_class,
+#       "params": {...},
+#       "calibration": {...}
+#     }
+#   }
+# }
+
+MODEL_REGISTRY = {
+    "Logistic Regression": {
+        "LR-LBFGS": {
+            "model_class": LogisticRegression,
+            "params": {
+                "penalty": "l2",
+                "C": 1e6,
+                "solver": "lbfgs",
+                "max_iter": 1000,
+                "random_state": 42,
+                "n_jobs": None
+            },
+            "calibration": {
+                "method": "sigmoid",
+                "cv": 3
+            }
+        },
+        "LR-SAGA": {
+            "model_class": LogisticRegression,
+            "params": {
+                "penalty": "l2",
+                "C": 1e6,
+                "solver": "saga",
+                "max_iter": 2000,
+                "random_state": 42
+            },
+            "calibration": {
+                "method": "sigmoid",
+                "cv": 3
+            }
+        },
+        "LR-Newton": {
+            "model_class": LogisticRegression,
+            "params": {
+                "penalty": "l2",
+                "C": 1e6,
+                "solver": "newton-cg",
+                "max_iter": 1000,
+                "random_state": 42
+            },
+            "calibration": {
+                "method": "sigmoid",
+                "cv": 3
+            }
+        }
+    },
+    "Regularized Logistic Regression": {
+        "LR-Reg-SAGA": {
+            "model_class": LogisticRegression,
+            "params": {
+                "penalty": "elasticnet",
+                "l1_ratio": 0.5,
+                "C": 1.0,
+                "solver": "saga",
+                "max_iter": 2000,
+                "random_state": 42
+            },
+            "calibration": {
+                "method": "sigmoid",
+                "cv": 3
+            }
+        },
+        "LR-Reg-LBFGS": {
+            "model_class": LogisticRegression,
+            "params": {
+                "penalty": "l2",
+                "C": 1.0,
+                "solver": "lbfgs",
+                "max_iter": 1000,
+                "random_state": 42,
+                "n_jobs": None
+            },
+            "calibration": {
+                "method": "sigmoid",
+                "cv": 3
+            }
+        },
+        "LR-Reg-Liblinear": {
+            "model_class": LogisticRegression,
+            "params": {
+                "penalty": "l1",
+                "C": 1.0,
+                "solver": "liblinear",
+                "max_iter": 1000,
+                "random_state": 42
+            },
+            "calibration": {
+                "method": "sigmoid",
+                "cv": 3
+            }
+        }
+    }
+}
+
+# --- AdaBoost group ---
+MODEL_REGISTRY["AdaBoost (Decision Tree Stumps)"] = {
+    "AdaBoost-10": {
+        "model_class": AdaBoostClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(max_depth=1),
+            "n_estimators": 10,
+            "algorithm": "SAMME",
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "AdaBoost-20": {
+        "model_class": AdaBoostClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(max_depth=1),
+            "n_estimators": 20,
+            "algorithm": "SAMME",
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "AdaBoost-30": {
+        "model_class": AdaBoostClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(max_depth=1),
+            "n_estimators": 30,
+            "algorithm": "SAMME",
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    }
+}
+
+# --- Bagging CART group ---
+MODEL_REGISTRY["Bagging (CART)"] = {
+    "BAG-CART-10": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(),
+            "n_estimators": 10,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-CART-20": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(),
+            "n_estimators": 20,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-CART-50": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(),
+            "n_estimators": 50,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-CART-100": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(),
+            "n_estimators": 100,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-CART-250": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(),
+            "n_estimators": 250,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-CART-500": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(),
+            "n_estimators": 500,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-CART-1000": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": DecisionTreeClassifier(),
+            "n_estimators": 1000,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    }
+}
+
+# --- Bagging MLP group ---
+MODEL_REGISTRY["Bagging (MLP)"] = {
+    "BAG-MLP-5": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=42),
+            "n_estimators": 5,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-MLP-10": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=42),
+            "n_estimators": 10,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "BAG-MLP-25": {
+        "model_class": BaggingClassifier,
+        "params": {
+            "estimator": MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=42),
+            "n_estimators": 25,
+            "random_state": 42
+        },
+        "calibration": {"method": "sigmoid", "cv": 3}
+    }
+}
+
+# --- Random Forest group ---
+MODEL_REGISTRY["Random Forest"] = {
+    "RF-100-sqrt": {
+        "model_class": RandomForestClassifier,
+        "params": {"n_estimators": 100, "max_features": "sqrt", "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "RF-250-0.25": {
+        "model_class": RandomForestClassifier,
+        "params": {"n_estimators": 250, "max_features": 0.25, "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "RF-500-0.5": {
+        "model_class": RandomForestClassifier,
+        "params": {"n_estimators": 500, "max_features": 0.5, "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    }
+}
+
+# --- Gradient Boosting group ---
+MODEL_REGISTRY["Gradient Boosting"] = {
+    "GB-10-0.1": {
+        "model_class": GradientBoostingClassifier,
+        "params": {"n_estimators": 10, "learning_rate": 0.1, "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "GB-50-0.1": {
+        "model_class": GradientBoostingClassifier,
+        "params": {"n_estimators": 50, "learning_rate": 0.1, "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "GB-100-0.1": {
+        "model_class": GradientBoostingClassifier,
+        "params": {"n_estimators": 100, "learning_rate": 0.1, "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "GB-500-0.05": {
+        "model_class": GradientBoostingClassifier,
+        "params": {"n_estimators": 500, "learning_rate": 0.05, "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "GB-1000-0.01": {
+        "model_class": GradientBoostingClassifier,
+        "params": {"n_estimators": 1000, "learning_rate": 0.01, "random_state": 42},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    }
+}
+
+# --- K-Nearest Neighbors group ---
+MODEL_REGISTRY["K-Nearest Neighbors"] = {
+    "KNN-3": {
+        "model_class": KNeighborsClassifier,
+        "params": {"n_neighbors": 3},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "KNN-5": {
+        "model_class": KNeighborsClassifier,
+        "params": {"n_neighbors": 5},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "KNN-7": {
+        "model_class": KNeighborsClassifier,
+        "params": {"n_neighbors": 7},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    },
+    "KNN-10": {
+        "model_class": KNeighborsClassifier,
+        "params": {"n_neighbors": 10},
+        "calibration": {"method": "sigmoid", "cv": 3}
+    }
+}
+
+# --- XGBoost group (optional dependency) ---
+try:
+    from xgboost import XGBClassifier
+    MODEL_REGISTRY["XGBoost"] = {
+        "XGB-10-0.3": {
+            "model_class": XGBClassifier,
+            "params": {"n_estimators": 10, "learning_rate": 0.3, "random_state": 42, "use_label_encoder": False, "eval_metric": "logloss"},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        },
+        "XGB-50-0.3": {
+            "model_class": XGBClassifier,
+            "params": {"n_estimators": 50, "learning_rate": 0.3, "random_state": 42, "use_label_encoder": False, "eval_metric": "logloss"},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        },
+        "XGB-100-0.3": {
+            "model_class": XGBClassifier,
+            "params": {"n_estimators": 100, "learning_rate": 0.3, "random_state": 42, "use_label_encoder": False, "eval_metric": "logloss"},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        },
+        "XGB-500-0.1": {
+            "model_class": XGBClassifier,
+            "params": {"n_estimators": 500, "learning_rate": 0.1, "random_state": 42, "use_label_encoder": False, "eval_metric": "logloss"},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        }
+    }
+except ImportError:
+    pass
+
+# --- LightGBM group (optional dependency) ---
+try:
+    from lightgbm import LGBMClassifier
+    MODEL_REGISTRY["LightGBM"] = {
+        "LGBM-10-0.3": {
+            "model_class": LGBMClassifier,
+            "params": {"n_estimators": 10, "learning_rate": 0.3, "random_state": 42},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        },
+        "LGBM-50-0.3": {
+            "model_class": LGBMClassifier,
+            "params": {"n_estimators": 50, "learning_rate": 0.3, "random_state": 42},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        },
+        "LGBM-100-0.3": {
+            "model_class": LGBMClassifier,
+            "params": {"n_estimators": 100, "learning_rate": 0.3, "random_state": 42},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        },
+        "LGBM-500-0.1": {
+            "model_class": LGBMClassifier,
+            "params": {"n_estimators": 500, "learning_rate": 0.1, "random_state": 42},
+            "calibration": {"method": "sigmoid", "cv": 3}
+        }
+    }
+except ImportError:
+    pass
+
+# --- PyTorch Deep Learning Models (optional dependency) ---
+try:
+    from services.torch_models import (
+        TorchMLPClassifier,
+        TorchTCNClassifier,
+        TorchTransformerEncoderClassifier,
+        TORCH_AVAILABLE,
+        TORCH_IMPORT_ERROR
+    )
+    if TORCH_AVAILABLE:
+        MODEL_REGISTRY["PyTorch Neural Networks"] = {
+            "Torch-MLP-64-32": {
+                "model_class": TorchMLPClassifier,
+                "params": {
+                    "hidden_dims": (64, 32),
+                    "dropout": 0.1,
+                    "lr": 1e-3,
+                    "batch_size": 256,
+                    "max_epochs": 50,
+                    "patience": 5,
+                    "verbose": False,
+                    "random_state": 42
+                },
+                "calibration": {"method": "sigmoid", "cv": 3}
+            },
+            "Torch-TCN-64": {
+                "model_class": TorchTCNClassifier,
+                "params": {
+                    "seq_len": 1,
+                    "channels": (64, 64, 64),
+                    "kernel_size": 3,
+                    "dropout": 0.1,
+                    "lr": 1e-3,
+                    "batch_size": 128,
+                    "max_epochs": 50,
+                    "patience": 5,
+                    "verbose": False,
+                    "random_state": 42
+                },
+                "calibration": {"method": "sigmoid", "cv": 3}
+            },
+            "Torch-Transformer-64": {
+                "model_class": TorchTransformerEncoderClassifier,
+                "params": {
+                    "seq_len": 1,
+                    "d_model": 64,
+                    "nhead": 4,
+                    "num_layers": 2,
+                    "dim_feedforward": 128,
+                    "dropout": 0.1,
+                    "lr": 1e-3,
+                    "batch_size": 128,
+                    "max_epochs": 50,
+                    "patience": 5,
+                    "verbose": False,
+                    "random_state": 42
+                },
+                "calibration": {"method": "sigmoid", "cv": 3}
+            }
+        }
+    else:
+        import sys
+        print(f"[model_registry] PyTorch models not registered. Reason: {TORCH_IMPORT_ERROR}", file=sys.stderr)
+except (ImportError, OSError, Exception) as e:
+    # PyTorch not available or failed to load - skip PyTorch models
+    import sys
+    print(f"[model_registry] Failed to import torch_models: {type(e).__name__}: {str(e)}", file=sys.stderr)
+
+
+def get_model_groups():
+    """
+    Return list of available model group names.
+
+    Returns:
+        List[str]: Model group names
+    """
+    return list(MODEL_REGISTRY.keys())
+
+
+def get_model_variants(group_name):
+    """
+    Get all model variant names for a given group.
+
+    Args:
+        group_name: Name of the model group
+
+    Returns:
+        List[str]: Model variant names in that group
+    """
+    if group_name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model group: {group_name}")
+
+    return list(MODEL_REGISTRY[group_name].keys())
+
+
+def get_model_config(group_name, variant_name):
+    """
+    Get the configuration for a specific model variant.
+
+    Args:
+        group_name: Name of the model group
+        variant_name: Name of the model variant
+
+    Returns:
+        dict: Model configuration with model_class, params, and calibration
+    """
+    if group_name not in MODEL_REGISTRY:
+        raise ValueError(f"Unknown model group: {group_name}")
+
+    if variant_name not in MODEL_REGISTRY[group_name]:
+        raise ValueError(f"Unknown model variant '{variant_name}' in group '{group_name}'")
+
+    return MODEL_REGISTRY[group_name][variant_name]
+
+
+def validate_model_selection(selected_model_groups):
+    """
+    Validate that selected model groups and variants exist in the registry.
+
+    Args:
+        selected_model_groups: Dict mapping group names to list of variant names
+            variant_names can be None (meaning "use all variants in the group")
+
+    Raises:
+        ValueError: If any group or variant is invalid
+    """
+    for group_name, variant_names in selected_model_groups.items():
+        if group_name not in MODEL_REGISTRY:
+            raise ValueError(f"Unknown model group: {group_name}")
+
+        # Skip validation if variant_names is None (means "use all variants")
+        if variant_names is None:
+            continue
+
+        for variant_name in variant_names:
+            if variant_name not in MODEL_REGISTRY[group_name]:
+                raise ValueError(
+                    f"Unknown model variant '{variant_name}' in group '{group_name}'. "
+                    f"Available variants: {list(MODEL_REGISTRY[group_name].keys())}"
+                )
+
+
+# Backward compatibility mapping (for old frontend code)
+LEGACY_MODEL_MAPPING = {
+    "LR": {
+        "group": "Logistic Regression",
+        "variant": "LR-LBFGS"
+    },
+    "LR-Reg": {
+        "group": "Regularized Logistic Regression",
+        "variant": "LR-Reg-SAGA"
+    }
+}
+
+
+def map_legacy_model_name(legacy_name):
+    """
+    Map old cryptic model names to new descriptive names.
+
+    Args:
+        legacy_name: Old model name like "LR" or "LR-Reg"
+
+    Returns:
+        dict: {"group": str, "variant": str}
+    """
+    if legacy_name not in LEGACY_MODEL_MAPPING:
+        raise ValueError(f"Unknown legacy model name: {legacy_name}")
+
+    return LEGACY_MODEL_MAPPING[legacy_name]

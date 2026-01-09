@@ -1,0 +1,455 @@
+"""
+Model persistence service for saving and loading trained models.
+Enables SHAP analysis to use actual trained models instead of retraining.
+"""
+import os
+import pickle
+import hashlib
+from datetime import datetime
+from typing import Optional, Tuple, Dict, Any
+from sklearn.pipeline import Pipeline
+
+
+def _get_models_dir():
+    """Get models directory from config."""
+    from config import get_models_dir
+    return get_models_dir()
+
+
+def _ensure_models_dir():
+    """Create models directory if it doesn't exist."""
+    models_dir = _get_models_dir()
+    os.makedirs(models_dir, exist_ok=True)
+
+
+def _generate_model_filename(filename: str, model_name: str, timestamp: datetime) -> str:
+    """
+    Generate unique filename for model storage.
+
+    Format: {dataset}_{model}_{timestamp_hash}.pkl
+
+    Args:
+        filename: Dataset filename (e.g., "credit_data.csv")
+        model_name: Model name (e.g., "Random Forest (entropy, 100)")
+        timestamp: Execution timestamp
+
+    Returns:
+        Filename string (e.g., "credit_data_RandomForest_abc12345.pkl")
+    """
+    # Clean dataset name (remove .csv and special characters)
+    clean_dataset = filename.replace('.csv', '').replace(' ', '_').replace('.', '_')
+
+    # Clean model name (remove special characters, keep alphanumeric)
+    clean_model = (
+        model_name
+        .replace(' ', '_')
+        .replace('(', '')
+        .replace(')', '')
+        .replace(',', '')
+        .replace('-', '_')
+        .replace('/', '_')
+    )
+
+    # Limit length
+    if len(clean_model) > 50:
+        clean_model = clean_model[:50]
+
+    # Create short hash from timestamp for uniqueness
+    ts_str = timestamp.isoformat()
+    hash_suffix = hashlib.md5(ts_str.encode()).hexdigest()[:8]
+
+    return f"{clean_dataset}_{clean_model}_{hash_suffix}.pkl"
+
+
+def save_model(model: Pipeline, filename: str, model_name: str, timestamp: datetime) -> str:
+    """
+    Save a trained model to disk.
+
+    Args:
+        model: Trained sklearn Pipeline or estimator
+        filename: Dataset filename
+        model_name: Model name
+        timestamp: Execution timestamp
+
+    Returns:
+        Relative path to saved model file (e.g., "models/credit_data_RF_abc12345.pkl")
+    """
+    _ensure_models_dir()
+
+    models_dir = _get_models_dir()
+    model_filename = _generate_model_filename(filename, model_name, timestamp)
+    model_path = os.path.join(models_dir, model_filename)
+
+    try:
+        with open(model_path, 'wb') as f:
+            pickle.dump(model, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # Return relative path for database storage (relative to backend directory)
+        return os.path.join(os.path.basename(models_dir), model_filename)
+
+    except Exception as e:
+        print(f"Error saving model to {model_path}: {e}")
+        return None
+
+
+def load_model(model_path: str) -> Optional[Pipeline]:
+    """
+    Load a trained model from disk.
+
+    Args:
+        model_path: Relative path to model file (e.g., "models/model.pkl") or absolute path
+
+    Returns:
+        Loaded model or None if not found
+    """
+    from config import get_models_dir
+
+    try:
+        # Handle both absolute and relative paths
+        if not os.path.isabs(model_path):
+            # If relative path starts with "models/", use configured models_dir
+            if model_path.startswith('models/') or model_path.startswith('models\\'):
+                # Extract just the filename
+                filename = os.path.basename(model_path)
+                full_path = os.path.join(get_models_dir(), filename)
+            else:
+                # Legacy: relative to project root
+                base_dir = os.path.dirname(os.path.dirname(__file__))
+                full_path = os.path.join(base_dir, model_path)
+        else:
+            full_path = model_path
+
+        if not os.path.exists(full_path):
+            print(f"Model file not found: {full_path}")
+            return None
+
+        with open(full_path, 'rb') as f:
+            model = pickle.load(f)
+
+        return model
+
+    except Exception as e:
+        print(f"Error loading model from {model_path}: {e}")
+        return None
+
+
+def delete_model(model_path: str) -> bool:
+    """
+    Delete a model file from disk.
+
+    Args:
+        model_path: Relative path to model file
+
+    Returns:
+        True if deleted, False if not found
+    """
+    try:
+        if not os.path.isabs(model_path):
+            base_dir = os.path.dirname(os.path.dirname(__file__))
+            model_path = os.path.join(base_dir, model_path)
+
+        if os.path.exists(model_path):
+            os.remove(model_path)
+            print(f"Deleted model: {model_path}")
+            return True
+
+        return False
+
+    except Exception as e:
+        print(f"Error deleting model {model_path}: {e}")
+        return False
+
+
+def get_best_model_for_dataset(filename: str, run_timestamp: Optional[str] = None) -> Optional[Tuple[Pipeline, Dict[str, Any]]]:
+    """
+    Get the best model for a dataset from a specific run or the most recent run.
+
+    Selection criteria:
+    1. Highest test AUC score (primary metric)
+    2. From specified run_timestamp (if provided)
+    3. Model file must exist on disk
+
+    Args:
+        filename: Dataset filename
+        run_timestamp: Optional specific run timestamp (ISO format string)
+
+    Returns:
+        Tuple of (model, model_metadata) or None if not found
+
+    Example:
+        model, metadata = get_best_model_for_dataset("credit.csv", "2025-12-24T10:30:00")
+        if model:
+            print(f"Loaded: {metadata['model_name']} with AUC={metadata['metrics']['test_auc']}")
+    """
+    from persistence.model_repository import load_model_results
+
+    # Get all results for this dataset
+    results = load_model_results(filename)
+
+    if not results:
+        print(f"No model results found for {filename}")
+        return None
+
+    # Filter by run_timestamp if specified
+    if run_timestamp:
+        # Handle both datetime and string timestamps
+        if isinstance(run_timestamp, datetime):
+            run_timestamp = run_timestamp.isoformat()
+
+        results = [r for r in results if r['timestamp'] == run_timestamp]
+
+        if not results:
+            print(f"No results found for timestamp {run_timestamp}")
+            return None
+
+    # Find result with highest test AUC score AND valid model_path
+    best_result = None
+    best_auc = -1
+
+    for result in results:
+        # Check if model_path exists
+        if 'model_path' not in result or not result['model_path']:
+            continue
+
+        # Check if metrics exist
+        if not result.get('metrics'):
+            continue
+
+        # Get AUC score (primary metric for model selection)
+        # Support both 'test_auc' (new format) and 'AUC' (old format) keys
+        metrics = result['metrics']
+        auc = metrics.get('test_auc') or metrics.get('AUC')
+
+        if auc is None:
+            continue
+
+        # Update best if higher AUC
+        if auc > best_auc:
+            best_auc = auc
+            best_result = result
+
+    if not best_result:
+        print(f"No valid models with AUC scores found for {filename}")
+        return None
+
+    # Load the model from disk
+    model = load_model(best_result['model_path'])
+
+    if model is None:
+        print(f"Could not load model from {best_result['model_path']}")
+        return None
+
+    print(f"Loaded best model: {best_result['model_name']} (AUC={best_auc:.4f})")
+
+    return model, best_result
+
+
+def load_model_by_name(filename: str, model_name: str, run_timestamp: Optional[datetime] = None) -> Optional[Pipeline]:
+    """
+    Load a specific trained model by name from a dataset run.
+
+    Args:
+        filename: Dataset filename
+        model_name: Full model name (e.g., "Logistic Regression (L2, LBFGS)")
+        run_timestamp: Optional specific run timestamp
+
+    Returns:
+        Loaded model or None if not found
+    """
+    from persistence.model_repository import load_model_results
+
+    # Get all results for this dataset
+    results = load_model_results(filename)
+
+    if not results:
+        print(f"No model results found for {filename}")
+        return None
+
+    # Filter by run_timestamp if specified
+    if run_timestamp:
+        # Handle both datetime and string timestamps
+        if isinstance(run_timestamp, datetime):
+            run_timestamp_str = run_timestamp.isoformat()
+        else:
+            run_timestamp_str = str(run_timestamp)
+
+        print(f"DEBUG load_model_by_name: Filtering by timestamp {run_timestamp_str}")
+        
+        # Try exact match first
+        filtered_results = [r for r in results if r['timestamp'] == run_timestamp_str]
+        
+        # If no exact match, try matching without timezone/Z if present
+        if not filtered_results:
+            clean_ts = run_timestamp_str.replace('Z', '').split('+')[0]
+            print(f"DEBUG load_model_by_name: No exact match, trying clean timestamp: {clean_ts}")
+            filtered_results = [r for r in results if r['timestamp'].replace('Z', '').split('+')[0] == clean_ts]
+            
+        if not filtered_results:
+            print(f"DEBUG load_model_by_name: Still no match. Available timestamps: {[r['timestamp'] for r in results[:3]]}")
+            return None
+            
+        results = filtered_results
+
+    # Find the specific model by name
+    target_result = None
+    for result in results:
+        if result.get('model_name') == model_name:
+            target_result = result
+            break
+
+    if not target_result:
+        print(f"Model '{model_name}' not found for {filename}")
+        return None
+
+    # Check if model_path exists
+    if 'model_path' not in target_result or not target_result['model_path']:
+        print(f"No model_path found for {model_name}")
+        return None
+
+    # Load the model from disk
+    model = load_model(target_result['model_path'])
+
+    if model is None:
+        print(f"Could not load model from {target_result['model_path']}")
+        return None
+
+    print(f"Loaded model: {model_name}")
+    return model
+
+
+def cleanup_old_models(filename: str, keep_recent: int = 5):
+    """
+    Clean up old model files for a dataset, keeping only the most recent N runs.
+
+    Args:
+        filename: Dataset filename
+        keep_recent: Number of recent runs to keep (default: 5)
+
+    Returns:
+        Number of models deleted
+    """
+    from persistence.model_repository import load_model_results
+
+    results = load_model_results(filename)
+
+    if not results:
+        return 0
+
+    # Sort by timestamp (newest first)
+    results.sort(key=lambda x: x['timestamp'], reverse=True)
+
+    # Get unique run timestamps
+    seen_timestamps = set()
+    models_to_keep = []
+
+    for result in results:
+        ts = result['timestamp']
+        if ts not in seen_timestamps:
+            seen_timestamps.add(ts)
+
+        # Keep models from the first N unique timestamps
+        if len(seen_timestamps) <= keep_recent:
+            if 'model_path' in result and result['model_path']:
+                models_to_keep.append(result['model_path'])
+
+    # Delete all other models
+    deleted_count = 0
+    for result in results:
+        if 'model_path' in result and result['model_path']:
+            if result['model_path'] not in models_to_keep:
+                if delete_model(result['model_path']):
+                    deleted_count += 1
+
+    print(f"Cleaned up {deleted_count} old models for {filename}")
+    return deleted_count
+
+
+def delete_dataset_models(filename: str) -> int:
+    """
+    Delete all model files associated with a dataset.
+    Similar to delete_dataset_images for consistency.
+    Uses filename pattern matching to find and delete model files.
+
+    Args:
+        filename: Dataset filename (e.g., "Australian Credit.csv")
+
+    Returns:
+        Number of models deleted
+    """
+    deleted_count = 0
+    models_dir = _get_models_dir()
+
+    # Create filename patterns (both original and with underscores)
+    base_name = filename.replace('.csv', '')
+    underscore_name = base_name.replace(' ', '_')
+
+    # List all files in models directory
+    try:
+        if not os.path.exists(models_dir):
+            print(f"Models directory does not exist: {models_dir}")
+            return 0
+
+        for model_file in os.listdir(models_dir):
+            # Check if file matches either pattern
+            if model_file.startswith(base_name) or model_file.startswith(underscore_name):
+                try:
+                    file_path = os.path.join(models_dir, model_file)
+                    os.remove(file_path)
+                    deleted_count += 1
+                    print(f"Deleted model file: {model_file}")
+                except Exception as e:
+                    print(f"Warning: Failed to delete model file {model_file}: {str(e)}")
+    except Exception as e:
+        print(f"Error accessing models directory: {str(e)}")
+
+    print(f"Deleted {deleted_count} model files for dataset '{filename}'")
+    return deleted_count
+
+
+def get_model_storage_stats() -> Dict[str, Any]:
+    """
+    Get statistics about model storage.
+
+    Returns:
+        Dict with storage statistics
+    """
+    _ensure_models_dir()
+
+    models_dir = _get_models_dir()
+    total_models = 0
+    total_size_bytes = 0
+
+    for filename in os.listdir(models_dir):
+        if filename.endswith('.pkl'):
+            total_models += 1
+            file_path = os.path.join(models_dir, filename)
+            total_size_bytes += os.path.getsize(file_path)
+
+    total_size_mb = total_size_bytes / (1024 * 1024)
+
+    return {
+        'total_models': total_models,
+        'total_size_mb': round(total_size_mb, 2),
+        'models_directory': models_dir
+    }
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    print("Model Persistence Service")
+    print("=" * 60)
+
+    stats = get_model_storage_stats()
+    print(f"\nStorage Statistics:")
+    print(f"  Total models: {stats['total_models']}")
+    print(f"  Total size: {stats['total_size_mb']} MB")
+    print(f"  Directory: {stats['models_directory']}")
+
+    # Test filename generation
+    from datetime import datetime
+    test_filename = _generate_model_filename(
+        "credit_data.csv",
+        "Random Forest (entropy, 100)",
+        datetime.now()
+    )
+    print(f"\nExample filename: {test_filename}")

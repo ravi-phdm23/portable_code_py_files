@@ -1,0 +1,182 @@
+"""
+SMOTE (Synthetic Minority Over-sampling Technique) service.
+Pure computation - no Flask, no database, no file I/O.
+"""
+
+import pandas as pd
+from imblearn.over_sampling import SMOTE
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from config import TEST_SIZE, RANDOM_STATE, MISSING_THRESHOLD
+
+
+def apply_smote_analysis(df, selected_features, apply_smote=False):
+    """
+    Apply SMOTE analysis on selected features.
+    
+    NOTE: selected_features should be the transformed feature names (after one-hot encoding)
+    as returned by feature importance calculation. This function applies the same preprocessing
+    to ensure feature names match.
+
+    Args:
+        df: DataFrame with 'target' column (original, untransformed)
+        selected_features: list of transformed feature names to use (after preprocessing)
+        apply_smote: boolean, whether to apply SMOTE
+
+    Returns:
+        dict with:
+            - original_distribution: dict with class counts before SMOTE
+            - resampled_distribution: dict with class counts after SMOTE (if applied)
+            - applied: boolean indicating if SMOTE was applied
+    """
+    # Validate target column exists
+    if 'target' not in df.columns:
+        raise ValueError("Required column 'target' not found in DataFrame")
+
+    if len(selected_features) == 0:
+        raise ValueError("No features selected. Please select at least one feature.")
+
+    # Step 1: Separate target and features
+    y = df['target']
+    X = df.drop(columns=['target'])
+
+    # Step 2: Drop high-missing columns (same as feature importance)
+    missing_ratios = X.isna().mean()
+    columns_to_keep = missing_ratios[missing_ratios <= MISSING_THRESHOLD].index.tolist()
+    X = X[columns_to_keep]
+
+    if X.empty:
+        raise ValueError("No features remain after dropping high-missing columns")
+
+    # Step 3: Apply preprocessing pipeline (same as feature importance)
+    numeric_cols = X.select_dtypes(include=['number']).columns.tolist()
+    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    numeric_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', MinMaxScaler())
+    ])
+
+    categorical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_pipeline, numeric_cols),
+            ('cat', categorical_pipeline, categorical_cols)
+        ]
+    )
+
+    # Fit and transform
+    X_transformed = preprocessor.fit_transform(X)
+
+    # Step 4: Get feature names after transformation and build base mapping
+    feature_names = []
+    base_features = []
+    feature_names.extend(numeric_cols)
+    base_features.extend(numeric_cols)
+
+    if categorical_cols:
+        cat_transformer = preprocessor.named_transformers_['cat']
+        onehot_encoder = cat_transformer.named_steps['onehot']
+        cat_feature_names = onehot_encoder.get_feature_names_out(categorical_cols)
+        feature_names.extend(cat_feature_names)
+
+        # map each one-hot feature back to its base categorical column
+        for fname in cat_feature_names:
+            matched_base = None
+            for col in categorical_cols:
+                if fname.startswith(f"{col}_") or fname.startswith(f"{col}="):
+                    matched_base = col
+                    break
+            if matched_base is None and len(categorical_cols) > 0:
+                matched_base = categorical_cols[0]
+            base_features.append(matched_base)
+
+    # Convert to DataFrame with proper column names
+    X_transformed_df = pd.DataFrame(X_transformed, columns=feature_names)
+
+    # Determine transformed columns to use based on selected_features (accept base names or transformed names)
+    # If user supplied transformed names that exactly match, keep them. Otherwise expand base names to their transformed children.
+    transformed_selected = []
+    # quick set for matching
+    feat_set = set(feature_names)
+    for sf in selected_features:
+        if sf in feat_set:
+            transformed_selected.append(sf)
+        else:
+            # treat as base feature: include all transformed cols whose base matches sf
+            for fname, base in zip(feature_names, base_features):
+                if base == sf:
+                    transformed_selected.append(fname)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    transformed_selected_unique = []
+    for f in transformed_selected:
+        if f not in seen:
+            transformed_selected_unique.append(f)
+            seen.add(f)
+
+    # Validate selected (transformed) features exist
+    missing_features = [f for f in transformed_selected_unique if f not in X_transformed_df.columns]
+    if missing_features:
+        raise ValueError(f"Selected features not found in DataFrame: {missing_features}")
+
+    # Step 6: Select only the requested (transformed) features
+    X = X_transformed_df[transformed_selected_unique]
+
+    # Get original class distribution
+    original_counts = y.value_counts().sort_index()
+    original_distribution = {
+        str(k): int(v) for k, v in original_counts.items()
+    }
+
+    if not apply_smote:
+        # Also return base-feature selections for clarity
+        # Build mapping transformed -> base
+        transformed_to_base = {fname: base for fname, base in zip(feature_names, base_features)}
+        base_selected = list({transformed_to_base.get(f, f) for f in transformed_selected_unique})
+
+        return {
+            'original_distribution': original_distribution,
+            'resampled_distribution': None,
+            'applied': False,
+            'selected_features_transformed': transformed_selected_unique,
+            'selected_features': base_selected
+        }
+
+    # Split data (SMOTE only on training data)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y
+    )
+
+    # Apply SMOTE on training data only
+    smote = SMOTE(random_state=RANDOM_STATE)
+    X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+
+    # Get resampled class distribution
+    resampled_counts = pd.Series(y_train_resampled).value_counts().sort_index()
+    resampled_distribution = {
+        str(k): int(v) for k, v in resampled_counts.items()
+    }
+
+    # Also compute base-feature selections
+    transformed_to_base = {fname: base for fname, base in zip(feature_names, base_features)}
+    base_selected = list({transformed_to_base.get(f, f) for f in transformed_selected_unique})
+
+    return {
+        'original_distribution': original_distribution,
+        'resampled_distribution': resampled_distribution,
+        'applied': True,
+        'selected_features_transformed': transformed_selected_unique,
+        'selected_features': base_selected
+    }

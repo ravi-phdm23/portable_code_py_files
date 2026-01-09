@@ -1,0 +1,382 @@
+"""
+Performance Trend Analysis LaTeX Figure Generator.
+Generates publication-ready performance trend charts using pgfplots.
+
+Supports two visualization modes:
+1. Six separate charts (2x3 grid) - Original implementation
+2. Unified B&W-optimized chart - Recommended for publications
+"""
+
+from typing import List, Dict, Any
+
+
+def generate_performance_trend_figure(benchmark_models: List[Dict[str, Any]]) -> str:
+    """
+    Generate LaTeX code for performance trend analysis across model families.
+
+    Creates a 2x3 grid of line charts showing model performance trends across
+    six key metrics: AUC, KS, Brier Score, H-Measure, Recall, and PCC.
+
+    Args:
+        benchmark_models: List of benchmark model results with metrics
+
+    Returns:
+        LaTeX figure code as string
+    """
+    if not benchmark_models:
+        return ""
+
+    latex = []
+
+    # Extract model names and metrics
+    models = []
+    data_rows = []
+
+    for model in benchmark_models:
+        model_name = model.get('model_name', 'Unknown')
+        # Convert model names to LaTeX-safe format
+        model_name_safe = model_name.replace('_', '\\_')
+        models.append(model_name_safe)
+
+        metrics = model.get('metrics', {})
+        data_rows.append({
+            'Model': model_name_safe,
+            'AUC': metrics.get('AUC', 0),
+            'BS': metrics.get('BS', 0),
+            'KS': metrics.get('KS', 0),
+            'H': metrics.get('H', 0),
+            'Recall': metrics.get('Recall', 0),
+            'PCC': metrics.get('PCC', 0)
+        })
+
+    if not data_rows:
+        return ""
+
+    # Build pgfplotstable data
+    latex.append("\\begin{figure}[ht]")
+    latex.append("    \\centering")
+    latex.append("    % Reduce spacing between columns to fit 3 plots side-by-side")
+    latex.append("    \\setlength{\\tabcolsep}{1pt}")
+    latex.append("")
+    latex.append("    % Data Table")
+    latex.append("    \\pgfplotstableread[row sep=\\\\,col sep=&]{")
+
+    # Header row
+    latex.append("        Model & AUC & BS & KS & H & Recall & PCC \\\\")
+
+    # Data rows
+    for row in data_rows:
+        line = f"        {row['Model']} & {row['AUC']:.4f} & {row['BS']:.4f} & {row['KS']:.4f} & {row['H']:.4f} & {row['Recall']:.4f} & {row['PCC']:.4f} \\\\"
+        latex.append(line)
+
+    latex.append("    }\\datatable")
+    latex.append("")
+
+    # Style definition
+    latex.append("    % Updated Style for Line Charts (Muted Colors + Adjusted Width)")
+    latex.append("    \\pgfplotsset{")
+    latex.append("        mylineplot/.style={")
+    latex.append("            width=0.30\\textwidth, % Reduced from 0.32 to fit labels")
+    latex.append("            height=4.5cm,")
+
+    # Build symbolic x coords from models
+    models_str = ', '.join(models)
+    latex.append(f"            symbolic x coords={{{models_str}}},")
+
+    latex.append("            xtick=data,")
+    latex.append("            nodes near coords,")
+    latex.append("            nodes near coords style={font=\\tiny, yshift=5pt},")
+    latex.append("            xticklabel style={rotate=45, anchor=east, font=\\tiny},")
+    latex.append("            ylabel style={font=\\scriptsize},")
+    latex.append("            title style={font=\\scriptsize, align=center}, % Smaller title font")
+    latex.append("            grid=major,")
+    latex.append("            sharp plot,")
+    latex.append("            every axis plot/.append style={thick, mark=*},")
+    latex.append("        }")
+    latex.append("    }")
+    latex.append("")
+
+    # Calculate appropriate y-axis ranges for each metric
+    def get_y_range(metric_key):
+        values = [row[metric_key] for row in data_rows if row[metric_key] is not None]
+        if not values:
+            return 0, 1
+        min_val = min(values)
+        max_val = max(values)
+        padding = (max_val - min_val) * 0.1
+        return max(0, min_val - padding), min(1, max_val + padding)
+
+    auc_min, auc_max = get_y_range('AUC')
+    bs_min, bs_max = get_y_range('BS')
+    ks_min, ks_max = get_y_range('KS')
+    h_min, h_max = get_y_range('H')
+    recall_min, recall_max = get_y_range('Recall')
+    pcc_min, pcc_max = get_y_range('PCC')
+
+    # Begin tabular for 2x3 grid
+    latex.append("    \\begin{tabular}{ccc}")
+    latex.append("        % --- ROW 1 ---")
+
+    # (a) AUC - Steel Blue
+    latex.append("        % (a) AUC - Steel Blue")
+    latex.append("        \\begin{tikzpicture}")
+    latex.append("            \\begin{axis}[")
+    latex.append("                mylineplot,")
+    latex.append("                ylabel={AUC},")
+    latex.append(f"                ymin={auc_min:.2f}, ymax={auc_max:.2f},")
+    latex.append("                title={(a) AUC\\\\(Higher is Better)}")
+    latex.append("            ]")
+    latex.append("            \\addplot[color=blue!10!black] table [x=Model, y=AUC] {\\datatable};")
+    latex.append("            \\end{axis}")
+    latex.append("        \\end{tikzpicture}")
+    latex.append("        &")
+
+    # (b) KS - Teal
+    latex.append("        % (b) KS - Teal")
+    latex.append("        \\begin{tikzpicture}")
+    latex.append("            \\begin{axis}[")
+    latex.append("                mylineplot,")
+    latex.append("                ylabel={KS},")
+    latex.append(f"                ymin={ks_min:.2f}, ymax={ks_max:.2f},")
+    latex.append("                title={(b) KS Statistic}")
+    latex.append("            ]")
+    latex.append("            \\addplot[color=teal!20!black] table [x=Model, y=KS] {\\datatable};")
+    latex.append("            \\end{axis}")
+    latex.append("        \\end{tikzpicture}")
+    latex.append("        &")
+
+    # (c) BS - Brick Red
+    latex.append("        % (c) BS - Brick Red")
+    latex.append("        \\begin{tikzpicture}")
+    latex.append("            \\begin{axis}[")
+    latex.append("                mylineplot,")
+    latex.append("                ylabel={BS},")
+    latex.append(f"                ymin={bs_min:.2f}, ymax={bs_max:.2f},")
+    latex.append("                title={(c) Brier Score\\\\(Lower is Better)}")
+    latex.append("            ]")
+    latex.append("            \\addplot[color=red!20!black] table [x=Model, y=BS] {\\datatable};")
+    latex.append("            \\end{axis}")
+    latex.append("        \\end{tikzpicture}")
+    latex.append("        \\\\[2em] % Increased vertical gap for x-axis labels")
+    latex.append("")
+    latex.append("        % --- ROW 2 ---")
+
+    # (d) H-Measure - Burnt Orange
+    latex.append("        % (d) H-Measure - Burnt Orange")
+    latex.append("        \\begin{tikzpicture}")
+    latex.append("            \\begin{axis}[")
+    latex.append("                mylineplot,")
+    latex.append("                ylabel={H-measure},")
+    latex.append(f"                ymin={h_min:.2f}, ymax={h_max:.2f},")
+    latex.append("                title={(d) H-Measure}")
+    latex.append("            ]")
+    latex.append("            \\addplot[color=orange!20!black] table [x=Model, y=H] {\\datatable};")
+    latex.append("            \\end{axis}")
+    latex.append("        \\end{tikzpicture}")
+    latex.append("        &")
+
+    # (e) Recall - Olive Green
+    latex.append("        % (e) Recall - Olive Green")
+    latex.append("        \\begin{tikzpicture}")
+    latex.append("            \\begin{axis}[")
+    latex.append("                mylineplot,")
+    latex.append("                ylabel={Recall},")
+    latex.append(f"                ymin={recall_min:.2f}, ymax={recall_max:.2f},")
+    latex.append("                title={(e) Recall}")
+    latex.append("            ]")
+    latex.append("            \\addplot[color=green!20!black] table [x=Model, y=Recall] {\\datatable};")
+    latex.append("            \\end{axis}")
+    latex.append("        \\end{tikzpicture}")
+    latex.append("        &")
+
+    # (f) PCC - Dark Violet
+    latex.append("        % (f) PCC - Dark Violet")
+    latex.append("        \\begin{tikzpicture}")
+    latex.append("            \\begin{axis}[")
+    latex.append("                mylineplot,")
+    latex.append("                ylabel={PCC},")
+    latex.append(f"                ymin={pcc_min:.2f}, ymax={pcc_max:.2f},")
+    latex.append("                title={(f) PCC (Accuracy)}")
+    latex.append("            ]")
+    latex.append("            \\addplot[color=violet!20!black] table [x=Model, y=PCC] {\\datatable};")
+    latex.append("            \\end{axis}")
+    latex.append("        \\end{tikzpicture}")
+    latex.append("        \\\\")
+    latex.append("    \\end{tabular}")
+
+    latex.append("    \\caption{Performance trend analysis of model families across six key metrics.}")
+    latex.append("    \\label{fig:generated_line_charts}")
+    latex.append("\\end{figure}")
+    latex.append("")
+
+    return "\n".join(latex)
+
+
+def generate_unified_performance_profile(benchmark_models: List[Dict[str, Any]]) -> str:
+    """
+    Generate unified B&W-optimized performance profile chart.
+
+    Creates a single chart with all six metrics overlaid, using distinct marker shapes
+    and line styles for grayscale compatibility. Follows research publication best
+    practices for accessibility and visual clarity.
+
+    Design Principles:
+    - Triple redundancy: Color + Line Style + Marker Shape
+    - Grayscale-distinguishable (IEEE/ACM standards)
+    - Primary metrics (AUC, Recall, PCC) use prominent styles
+    - Secondary metrics (BS, KS, H) use lighter/dashed styles
+    - Normalized 0-1 scale for cross-metric comparison
+
+    Args:
+        benchmark_models: List of benchmark model results with metrics
+
+    Returns:
+        LaTeX figure code as string
+    """
+    if not benchmark_models:
+        return ""
+
+    latex = []
+
+    # Extract model names and metrics
+    models = []
+    data_rows = []
+
+    for model in benchmark_models:
+        model_name = model.get('model_name', 'Unknown')
+        # Convert model names to LaTeX-safe format
+        model_name_safe = model_name.replace('_', '\\_').replace('&', '\\&')
+        models.append(model_name_safe)
+
+        metrics = model.get('metrics', {})
+        data_rows.append({
+            'Model': model_name_safe,
+            'AUC': metrics.get('AUC', 0),
+            'BS': metrics.get('BS', 0),
+            'KS': metrics.get('KS', 0),
+            'H': metrics.get('H', 0),
+            'Recall': metrics.get('Recall', 0),
+            'PCC': metrics.get('PCC', 0)
+        })
+
+    if not data_rows:
+        return ""
+
+    # Build figure
+    latex.append("\\begin{figure}[ht]")
+    latex.append("    \\centering")
+    latex.append("    % Data Table for Unified Performance Profile")
+    latex.append("    \\pgfplotstableread[row sep=\\\\,col sep=&]{")
+
+    # Header row
+    latex.append("        Model & AUC & BS & KS & H & Recall & PCC \\\\")
+
+    # Data rows
+    for row in data_rows:
+        line = f"        {row['Model']} & {row['AUC']:.4f} & {row['BS']:.4f} & {row['KS']:.4f} & {row['H']:.4f} & {row['Recall']:.4f} & {row['PCC']:.4f} \\\\"
+        latex.append(line)
+
+    latex.append("    }\\datatable")
+    latex.append("")
+
+    # Begin tikzpicture
+    latex.append("    \\begin{tikzpicture}")
+    latex.append("        \\begin{axis}[")
+    latex.append("            width=\\textwidth,")
+    latex.append("            height=9cm,")
+
+    # Build symbolic x coords
+    models_str = ', '.join(models)
+    latex.append(f"            symbolic x coords={{{models_str}}},")
+
+    latex.append("            xtick=data,")
+    latex.append("            xticklabel style={rotate=45, anchor=east, font=\\footnotesize},")
+    latex.append("            ylabel={Metric Value},")
+    latex.append("            ylabel style={font=\\small},")
+    latex.append("            title={\\textbf{Unified Performance Profile (B\\&W Optimized)}},")
+    latex.append("            title style={font=\\normalsize, yshift=8pt},")
+    latex.append("            grid=major,")
+    latex.append("            grid style={line width=0.1pt, draw=gray!30},")
+    latex.append("            legend style={")
+    latex.append("                at={(0.5,-0.28)},")
+    latex.append("                anchor=north,")
+    latex.append("                legend columns=3,")
+    latex.append("                font=\\footnotesize,")
+    latex.append("                /tikz/every even column/.append style={column sep=8pt},")
+    latex.append("                draw=black,")
+    latex.append("                fill=white,")
+    latex.append("                fill opacity=0.8,")
+    latex.append("                text opacity=1")
+    latex.append("            },")
+    latex.append("            every axis plot/.append style={line width=1.2pt, mark size=3pt},")
+    latex.append("            enlarge x limits=0.06,")
+    latex.append("            ymin=0, ymax=1.0,")
+    latex.append("            ytick={0,0.2,0.4,0.6,0.8,1.0},")
+    latex.append("            minor y tick num=1")
+    latex.append("        ]")
+    latex.append("")
+
+    # PRIMARY METRICS (Higher is Better) - Solid/Prominent Styles
+    latex.append("        % PRIMARY METRICS (Higher is Better)")
+    latex.append("")
+
+    # 1. AUC: Solid + Circle (Most important)
+    latex.append("        % 1. AUC: Solid line + Circle marker")
+    latex.append("        \\addplot[black, mark=*, solid, line width=1.4pt]")
+    latex.append("            table [x=Model, y=AUC] {\\datatable};")
+    latex.append("        \\addlegendentry{AUC}")
+    latex.append("")
+
+    # 2. Recall: Densely Dashed + Pentagon
+    latex.append("        % 2. Recall: Densely dashed + Pentagon marker")
+    latex.append("        \\addplot[black, mark=pentagon*, densely dashed, line width=1.2pt]")
+    latex.append("            table [x=Model, y=Recall] {\\datatable};")
+    latex.append("        \\addlegendentry{Recall}")
+    latex.append("")
+
+    # 3. PCC: Loosely Dotted + Star
+    latex.append("        % 3. PCC: Loosely dotted + Star marker")
+    latex.append("        \\addplot[black!80, mark=star, loosely dotted, mark size=3.5pt]")
+    latex.append("            table [x=Model, y=PCC] {\\datatable};")
+    latex.append("        \\addlegendentry{PCC (Accuracy)}")
+    latex.append("")
+
+    # SECONDARY/COST METRICS - Lighter/Dashed Styles
+    latex.append("        % SECONDARY/COST METRICS")
+    latex.append("")
+
+    # 4. Brier Score: Dashed + Square
+    latex.append("        % 4. Brier Score: Dashed + Square marker (Lower is better)")
+    latex.append("        \\addplot[black!70, mark=square*, dashed]")
+    latex.append("            table [x=Model, y=BS] {\\datatable};")
+    latex.append("        \\addlegendentry{Brier Score (BS)}")
+    latex.append("")
+
+    # 5. KS Statistic: Dotted + Triangle
+    latex.append("        % 5. KS Statistic: Dotted + Triangle marker")
+    latex.append("        \\addplot[black!70, mark=triangle*, dotted, mark size=3.5pt]")
+    latex.append("            table [x=Model, y=KS] {\\datatable};")
+    latex.append("        \\addlegendentry{KS Statistic}")
+    latex.append("")
+
+    # 6. H-Measure: Dash-Dotted + Diamond
+    latex.append("        % 6. H-Measure: Dash-dotted + Diamond marker")
+    latex.append("        \\addplot[black!60, mark=diamond*, dash dot, mark size=3pt]")
+    latex.append("            table [x=Model, y=H] {\\datatable};")
+    latex.append("        \\addlegendentry{H-Measure}")
+    latex.append("")
+
+    latex.append("        \\end{axis}")
+    latex.append("    \\end{tikzpicture}")
+    latex.append("")
+
+    # Caption with explanatory note
+    latex.append("    \\caption{Unified performance profile comparing six classification metrics across benchmark models. ")
+    latex.append("Lines differentiated by marker shapes (circle, pentagon, star, square, triangle, diamond) ")
+    latex.append("and line patterns (solid, dashed, dotted, dash-dot) for grayscale compatibility. ")
+    latex.append("Note: Brier Score is a cost metric (lower is better); all others favor higher values.}")
+    latex.append("    \\label{fig:unified_performance_profile}")
+    latex.append("\\end{figure}")
+    latex.append("")
+
+    return "\n".join(latex)

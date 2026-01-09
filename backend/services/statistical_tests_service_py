@@ -1,0 +1,512 @@
+"""
+Statistical Significance Testing Service
+
+Implements three key statistical tests for comparing machine learning models:
+1. Wilcoxon Signed-Rank Test - for paired performance differences (AUC, F1, etc.)
+2. McNemar's Test - for correlated classification outcomes (predictions)
+3. DeLong's Test - for comparing AUC curves
+
+References:
+- Demšar, J. (2006). Statistical comparisons of classifiers over multiple data sets.
+- McNemar, Q. (1947). Note on the sampling error of the difference between correlated proportions.
+- DeLong, E. R., DeLong, D. M., & Clarke-Pearson, D. L. (1988). Comparing the areas under two or more correlated ROC curves.
+"""
+
+import numpy as np
+from scipy import stats
+from scipy.stats import wilcoxon, norm
+from sklearn.metrics import roc_auc_score, confusion_matrix
+from typing import Dict, List, Tuple, Optional
+import json
+from datetime import datetime
+from persistence.db import get_db_session, StatisticalTestResult
+
+
+def wilcoxon_signed_rank_test(
+    scores_1: np.ndarray,
+    scores_2: np.ndarray,
+    metric_name: str = "AUC"
+) -> Dict:
+    """
+    Wilcoxon Signed-Rank Test for paired performance differences.
+
+    Tests whether two models have significantly different performance
+    based on paired cross-validation scores or bootstrap samples.
+
+    Args:
+        scores_1: Performance scores for model 1 (e.g., AUC across folds)
+        scores_2: Performance scores for model 2
+        metric_name: Name of the metric being compared
+
+    Returns:
+        Dictionary with test results including statistic, p-value, and effect size
+    """
+    scores_1 = np.array(scores_1)
+    scores_2 = np.array(scores_2)
+
+    if len(scores_1) != len(scores_2):
+        raise ValueError("Score arrays must have the same length")
+
+    if len(scores_1) < 5:
+        raise ValueError("Need at least 5 paired samples for reliable Wilcoxon test")
+
+    # Calculate differences
+    differences = scores_1 - scores_2
+
+    # Perform Wilcoxon signed-rank test
+    # alternative='two-sided' tests if distributions differ in any direction
+    try:
+        statistic, p_value = wilcoxon(differences, alternative='two-sided')
+    except ValueError as e:
+        # Handle case where all differences are zero
+        if "zero_method" in str(e) or "all zero" in str(e).lower():
+            statistic = 0.0
+            p_value = 1.0
+        else:
+            raise
+
+    # Calculate effect size (r = Z / sqrt(N))
+    n = len(differences)
+    z_score = norm.ppf(1 - p_value / 2)  # Two-tailed z-score
+    effect_size = abs(z_score) / np.sqrt(n)
+
+    # Calculate mean difference and confidence interval
+    mean_diff = np.mean(differences)
+    std_diff = np.std(differences, ddof=1)
+    se_diff = std_diff / np.sqrt(n)
+    ci_95 = (mean_diff - 1.96 * se_diff, mean_diff + 1.96 * se_diff)
+
+    return {
+        "test_type": "wilcoxon",
+        "metric_name": metric_name,
+        "statistic": float(statistic),
+        "p_value": float(p_value),
+        "significant": p_value < 0.05,
+        "effect_size": float(effect_size),
+        "mean_difference": float(mean_diff),
+        "confidence_interval_95": [float(ci_95[0]), float(ci_95[1])],
+        "n_samples": int(n),
+        "interpretation": _interpret_wilcoxon(p_value, mean_diff, metric_name)
+    }
+
+
+def mcnemar_test(
+    y_true: np.ndarray,
+    y_pred_1: np.ndarray,
+    y_pred_2: np.ndarray
+) -> Dict:
+    """
+    McNemar's Test for correlated classification outcomes.
+
+    Tests whether two classifiers have significantly different error rates
+    on the same test set. Focuses on disagreements between models.
+
+    Args:
+        y_true: True labels
+        y_pred_1: Predictions from model 1
+        y_pred_2: Predictions from model 2
+
+    Returns:
+        Dictionary with test results including statistic, p-value, and contingency table
+    """
+    y_true = np.array(y_true)
+    y_pred_1 = np.array(y_pred_1)
+    y_pred_2 = np.array(y_pred_2)
+
+    if not (len(y_true) == len(y_pred_1) == len(y_pred_2)):
+        raise ValueError("All arrays must have the same length")
+
+    # Build contingency table
+    # Rows: Model 1 correct (1) or wrong (0)
+    # Cols: Model 2 correct (1) or wrong (0)
+    model_1_correct = (y_pred_1 == y_true).astype(int)
+    model_2_correct = (y_pred_2 == y_true).astype(int)
+
+    # McNemar's table:
+    # n_00: both wrong
+    # n_01: model 1 wrong, model 2 correct
+    # n_10: model 1 correct, model 2 wrong
+    # n_11: both correct
+    n_00 = np.sum((model_1_correct == 0) & (model_2_correct == 0))
+    n_01 = np.sum((model_1_correct == 0) & (model_2_correct == 1))
+    n_10 = np.sum((model_1_correct == 1) & (model_2_correct == 0))
+    n_11 = np.sum((model_1_correct == 1) & (model_2_correct == 1))
+
+    # McNemar's test focuses on disagreements: n_01 and n_10
+    # Null hypothesis: n_01 = n_10 (models make errors on same cases)
+
+    # Use continuity correction for small samples
+    if n_01 + n_10 < 25:
+        # Exact binomial test
+        from scipy.stats import binomtest
+        result = binomtest(min(n_01, n_10), n_01 + n_10, 0.5, alternative='two-sided')
+        statistic = None  # Exact test doesn't have chi-square statistic
+        p_value = result.pvalue
+    else:
+        # Chi-square approximation with continuity correction
+        statistic = ((abs(n_01 - n_10) - 1) ** 2) / (n_01 + n_10)
+        p_value = 1 - stats.chi2.cdf(statistic, df=1)
+
+    # Calculate accuracy for both models
+    accuracy_1 = (n_10 + n_11) / len(y_true)
+    accuracy_2 = (n_01 + n_11) / len(y_true)
+
+    return {
+        "test_type": "mcnemar",
+        "statistic": float(statistic) if statistic is not None else None,
+        "p_value": float(p_value),
+        "significant": p_value < 0.05,
+        "contingency_table": {
+            "both_wrong": int(n_00),
+            "model1_wrong_model2_correct": int(n_01),
+            "model1_correct_model2_wrong": int(n_10),
+            "both_correct": int(n_11)
+        },
+        "disagreements": int(n_01 + n_10),
+        "accuracy_model_1": float(accuracy_1),
+        "accuracy_model_2": float(accuracy_2),
+        "interpretation": _interpret_mcnemar(p_value, n_01, n_10, accuracy_1, accuracy_2)
+    }
+
+
+def delong_test(
+    y_true: np.ndarray,
+    y_score_1: np.ndarray,
+    y_score_2: np.ndarray
+) -> Dict:
+    """
+    DeLong's Test for comparing two correlated ROC AUC scores.
+
+    Tests whether two classifiers have significantly different AUC values
+    when evaluated on the same test set.
+
+    Implementation based on:
+    DeLong, E. R., DeLong, D. M., & Clarke-Pearson, D. L. (1988).
+    Comparing the areas under two or more correlated receiver operating characteristic curves.
+
+    Args:
+        y_true: True binary labels
+        y_score_1: Predicted probabilities/scores from model 1
+        y_score_2: Predicted probabilities/scores from model 2
+
+    Returns:
+        Dictionary with test results including AUCs, statistic, p-value, and confidence intervals
+    """
+    y_true = np.array(y_true)
+    y_score_1 = np.array(y_score_1)
+    y_score_2 = np.array(y_score_2)
+
+    if not (len(y_true) == len(y_score_1) == len(y_score_2)):
+        raise ValueError("All arrays must have the same length")
+
+    # Calculate AUCs
+    try:
+        auc_1 = roc_auc_score(y_true, y_score_1)
+        auc_2 = roc_auc_score(y_true, y_score_2)
+    except ValueError as e:
+        raise ValueError(f"Cannot compute AUC: {e}")
+
+    # Compute DeLong test statistic
+    z_statistic, p_value, var_1, var_2, covar = _delong_roc_variance(
+        y_true, y_score_1, y_score_2
+    )
+
+    # Calculate 95% confidence intervals for each AUC
+    ci_1 = (auc_1 - 1.96 * np.sqrt(var_1), auc_1 + 1.96 * np.sqrt(var_1))
+    ci_2 = (auc_2 - 1.96 * np.sqrt(var_2), auc_2 + 1.96 * np.sqrt(var_2))
+
+    # Calculate confidence interval for AUC difference
+    auc_diff = auc_1 - auc_2
+    se_diff = np.sqrt(var_1 + var_2 - 2 * covar)
+    ci_diff = (auc_diff - 1.96 * se_diff, auc_diff + 1.96 * se_diff)
+
+    return {
+        "test_type": "delong",
+        "auc_model_1": float(auc_1),
+        "auc_model_2": float(auc_2),
+        "auc_difference": float(auc_diff),
+        "statistic": float(z_statistic),
+        "p_value": float(p_value),
+        "significant": p_value < 0.05,
+        "variance_model_1": float(var_1),
+        "variance_model_2": float(var_2),
+        "covariance": float(covar),
+        "ci_95_model_1": [float(ci_1[0]), float(ci_1[1])],
+        "ci_95_model_2": [float(ci_2[0]), float(ci_2[1])],
+        "ci_95_difference": [float(ci_diff[0]), float(ci_diff[1])],
+        "interpretation": _interpret_delong(p_value, auc_1, auc_2)
+    }
+
+
+def _delong_roc_variance(y_true, y_score_1, y_score_2):
+    """
+    Compute DeLong test statistic and variances.
+
+    Returns:
+        z_statistic, p_value, var_1, var_2, covar
+    """
+    # Separate positive and negative samples
+    order = np.argsort(-y_true)  # Sort so positives come first
+    y_true_sorted = y_true[order]
+
+    # Count positives and negatives
+    n_pos = np.sum(y_true == 1)
+    n_neg = np.sum(y_true == 0)
+
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError("Need both positive and negative samples")
+
+    # Compute structural components for both models
+    V1_pos, V1_neg = _compute_V_matrices(y_true, y_score_1)
+    V2_pos, V2_neg = _compute_V_matrices(y_true, y_score_2)
+
+    # Compute AUCs
+    auc_1 = roc_auc_score(y_true, y_score_1)
+    auc_2 = roc_auc_score(y_true, y_score_2)
+
+    # Compute variances
+    var_1 = _compute_auc_variance(V1_pos, V1_neg, n_pos, n_neg)
+    var_2 = _compute_auc_variance(V2_pos, V2_neg, n_pos, n_neg)
+
+    # Compute covariance
+    covar = _compute_auc_covariance(V1_pos, V1_neg, V2_pos, V2_neg, n_pos, n_neg)
+
+    # Compute z-statistic
+    auc_diff = auc_1 - auc_2
+    se_diff = np.sqrt(var_1 + var_2 - 2 * covar)
+
+    if se_diff == 0:
+        z_statistic = 0.0
+        p_value = 1.0
+    else:
+        z_statistic = auc_diff / se_diff
+        p_value = 2 * (1 - norm.cdf(abs(z_statistic)))  # Two-tailed
+
+    return z_statistic, p_value, var_1, var_2, covar
+
+
+def _compute_V_matrices(y_true, y_score):
+    """Compute V matrices for DeLong method"""
+    n = len(y_true)
+    pos_indices = np.where(y_true == 1)[0]
+    neg_indices = np.where(y_true == 0)[0]
+
+    n_pos = len(pos_indices)
+    n_neg = len(neg_indices)
+
+    # V matrices for positives and negatives
+    V_pos = np.zeros(n_pos)
+    V_neg = np.zeros(n_neg)
+
+    # For each positive sample
+    for i, pos_idx in enumerate(pos_indices):
+        # Count how many negatives have lower score
+        V_pos[i] = np.mean(y_score[pos_idx] > y_score[neg_indices])
+
+    # For each negative sample
+    for i, neg_idx in enumerate(neg_indices):
+        # Count how many positives have higher score
+        V_neg[i] = np.mean(y_score[pos_indices] > y_score[neg_idx])
+
+    return V_pos, V_neg
+
+
+def _compute_auc_variance(V_pos, V_neg, n_pos, n_neg):
+    """Compute variance of AUC estimate"""
+    var_pos = np.var(V_pos, ddof=1) if len(V_pos) > 1 else 0
+    var_neg = np.var(V_neg, ddof=1) if len(V_neg) > 1 else 0
+
+    variance = (var_pos / n_pos) + (var_neg / n_neg)
+    return variance
+
+
+def _compute_auc_covariance(V1_pos, V1_neg, V2_pos, V2_neg, n_pos, n_neg):
+    """Compute covariance between two AUC estimates"""
+    if len(V1_pos) <= 1 or len(V2_pos) <= 1:
+        cov_pos = 0
+    else:
+        cov_pos = np.cov(V1_pos, V2_pos)[0, 1]
+
+    if len(V1_neg) <= 1 or len(V2_neg) <= 1:
+        cov_neg = 0
+    else:
+        cov_neg = np.cov(V1_neg, V2_neg)[0, 1]
+
+    covariance = (cov_pos / n_pos) + (cov_neg / n_neg)
+    return covariance
+
+
+def _interpret_wilcoxon(p_value: float, mean_diff: float, metric_name: str) -> str:
+    """Generate human-readable interpretation of Wilcoxon test"""
+    if p_value >= 0.05:
+        return f"No significant difference in {metric_name} between models (p={p_value:.4f})"
+    else:
+        direction = "higher" if mean_diff > 0 else "lower"
+        return f"Model 1 has significantly {direction} {metric_name} (p={p_value:.4f}, diff={mean_diff:.4f})"
+
+
+def _interpret_mcnemar(p_value: float, n_01: int, n_10: int, acc_1: float, acc_2: float) -> str:
+    """Generate human-readable interpretation of McNemar test"""
+    if p_value >= 0.05:
+        return f"No significant difference in classification accuracy (p={p_value:.4f})"
+    else:
+        if n_10 > n_01:
+            return f"Model 1 significantly outperforms Model 2 (p={p_value:.4f}, Acc1={acc_1:.4f}, Acc2={acc_2:.4f})"
+        else:
+            return f"Model 2 significantly outperforms Model 1 (p={p_value:.4f}, Acc1={acc_1:.4f}, Acc2={acc_2:.4f})"
+
+
+def _interpret_delong(p_value: float, auc_1: float, auc_2: float) -> str:
+    """Generate human-readable interpretation of DeLong test"""
+    if p_value >= 0.05:
+        return f"No significant difference in AUC between models (p={p_value:.4f})"
+    else:
+        if auc_1 > auc_2:
+            return f"Model 1 has significantly higher AUC (p={p_value:.4f}, AUC1={auc_1:.4f}, AUC2={auc_2:.4f})"
+        else:
+            return f"Model 2 has significantly higher AUC (p={p_value:.4f}, AUC1={auc_1:.4f}, AUC2={auc_2:.4f})"
+
+
+def save_statistical_test_result(
+    filename: str,
+    run_timestamp: datetime,
+    model_1_name: str,
+    model_2_name: str,
+    test_result: Dict
+) -> int:
+    """
+    Save statistical test result to database.
+
+    Returns:
+        ID of the inserted record
+    """
+    print(f"DEBUG save_statistical_test_result: Saving test result for {model_1_name} vs {model_2_name}")
+    print(f"DEBUG: test_result = {test_result}")
+    
+    db = get_db_session()
+    try:
+        # Convert numpy types to native Python types for JSON serialization
+        clean_result = {}
+        for key, value in test_result.items():
+            if isinstance(value, (np.bool_, np.integer, np.floating)):
+                clean_result[key] = value.item()  # Convert numpy type to Python type
+            else:
+                clean_result[key] = value
+
+        result_entry = StatisticalTestResult(
+            filename=filename,
+            run_timestamp=run_timestamp,
+            model_1_name=model_1_name,
+            model_2_name=model_2_name,
+            test_type=clean_result["test_type"],
+            statistic=clean_result.get("statistic"),
+            p_value=float(clean_result["p_value"]),
+            effect_size=clean_result.get("effect_size"),
+            significant=1 if clean_result["significant"] else 0,
+            result_metadata=json.dumps(clean_result),
+            timestamp=datetime.now()
+        )
+        db.add(result_entry)
+        db.commit()
+        db.refresh(result_entry)
+        print(f"DEBUG: Saved test result with ID {result_entry.id}")
+        return result_entry.id
+    except Exception as e:
+        print(f"ERROR: Failed to save statistical test result: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise
+    finally:
+        db.close()
+
+
+def get_statistical_test_results(filename: str, run_timestamp: Optional[datetime] = None) -> List[Dict]:
+    """
+    Retrieve statistical test results from database.
+
+    Args:
+        filename: Dataset filename
+        run_timestamp: Optional filter by specific run timestamp (if not found, returns most recent)
+
+    Returns:
+        List of test results as dictionaries
+    """
+    db = get_db_session()
+    try:
+        query = db.query(StatisticalTestResult).filter(
+            StatisticalTestResult.filename == filename
+        )
+
+        if run_timestamp:
+            # First try exact timestamp match
+            specific_results = query.filter(
+                StatisticalTestResult.run_timestamp == run_timestamp
+            ).all()
+
+            # If no exact match, get most recent results for this dataset
+            if not specific_results:
+                print(f"No statistical tests found for exact timestamp {run_timestamp}, fetching most recent tests for {filename}")
+                results = query.order_by(StatisticalTestResult.timestamp.desc()).all()
+            else:
+                results = specific_results
+        else:
+            results = query.all()
+
+        # Transform to match frontend expected format
+        formatted_results = []
+        for r in results:
+            metadata = json.loads(r.result_metadata) if r.result_metadata else {}
+
+            # Build result object matching test function output format
+            result_obj = {
+                "test_type": r.test_type,
+                "statistic": r.statistic,
+                "p_value": r.p_value,
+                "significant": bool(r.significant),
+                "effect_size": r.effect_size,
+                **metadata  # Include all metadata fields
+            }
+
+            # Add interpretation if not in metadata
+            if "interpretation" not in result_obj:
+                if r.p_value < 0.05:
+                    result_obj["interpretation"] = f"Significant difference detected (p={r.p_value:.4f})"
+                else:
+                    result_obj["interpretation"] = f"No significant difference (p={r.p_value:.4f})"
+
+            formatted_results.append({
+                "model_pair": f"{r.model_1_name} vs {r.model_2_name}",
+                "test": r.test_type,
+                "result": result_obj
+            })
+
+        return formatted_results
+    finally:
+        db.close()
+
+
+def delete_statistical_test_results(filename: str, run_timestamp: Optional[datetime] = None) -> int:
+    """
+    Delete statistical test results from database.
+
+    Args:
+        filename: Dataset filename
+        run_timestamp: Optional filter by specific run timestamp
+
+    Returns:
+        Number of deleted records
+    """
+    db = get_db_session()
+    try:
+        query = db.query(StatisticalTestResult).filter(
+            StatisticalTestResult.filename == filename
+        )
+
+        if run_timestamp:
+            query = query.filter(StatisticalTestResult.run_timestamp == run_timestamp)
+
+        count = query.delete()
+        db.commit()
+        return count
+    finally:
+        db.close()

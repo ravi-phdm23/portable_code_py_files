@@ -1,0 +1,180 @@
+"""
+Dataset Quality Summary LaTeX Generation Service.
+Generates Table X for peer-reviewed papers with consistent formatting.
+"""
+
+from typing import List, Dict, Any
+
+
+def _escape_latex(text: str) -> str:
+    """
+    Escape special LaTeX characters.
+    Reuses the same logic as latex_service.py for consistency.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    # Must escape backslash FIRST, before other replacements
+    text = text.replace('\\', r'\textbackslash{}')
+
+    # Then escape other special characters
+    replacements = {
+        '&': r'\&',
+        '%': r'\%',
+        '$': r'\$',
+        '#': r'\#',
+        '_': r'\_',
+        '{': r'\{',
+        '}': r'\}',
+        '~': r'\textasciitilde{}',
+        '^': r'\^{}',
+        '<': r'\textless{}',
+        '>': r'\textgreater{}',
+        '|': r'\textbar{}',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return text
+
+
+def generate_dataset_quality_latex_table(quality_data: List[Dict[str, Any]], filename: str = "") -> str:
+    """
+    Generate LaTeX table for Dataset Structure and Quality Summary (Table X).
+
+    Follows the same format as other tables in the report (booktabs style).
+
+    Args:
+        quality_data: List of dicts with keys:
+            - Variable
+            - Type
+            - Missing (%)
+            - Unique
+            - Dominant value (%)
+            - Mean (if numeric)
+        filename: Optional dataset filename for caption
+
+    Returns:
+        LaTeX table code as string
+    """
+    if not quality_data:
+        return "\\textit{No dataset quality summary available.}\n"
+
+    latex = []
+
+    # Table environment
+    latex.append("\\begin{table}[H]")
+    latex.append("\\centering")
+
+    # Caption
+    if filename:
+        caption = f"Dataset Structure and Quality Summary  {_escape_latex(filename)}"
+    else:
+        caption = "Dataset Structure and Quality Summary"
+
+    latex.append(f"\\caption{{{caption}. This table exposes data quality constraints including missingness, class imbalance, categorical dominance, and sparsity to enable critical evaluation of modeling assumptions and preprocessing justifications.}}")
+    latex.append("\\label{tab:dataset_quality}")
+
+    # Use footnotesize for better fit
+    latex.append("\\footnotesize")
+
+    # Wrap in adjustbox for wide tables
+    latex.append("\\begin{adjustbox}{max width=\\textwidth}")
+
+    # Column specification: l for Variable, c for all others
+    # 6 columns total (removed N)
+    latex.append("\\begin{tabular}{l c c c l c}")
+    latex.append("\\toprule")
+
+    # Header row - escape the % symbol
+    latex.append("Variable & Type & Missing (\\%) & Unique & Dominant value (\\%) & Mean (if numeric) \\\\")
+    latex.append("\\midrule")
+
+    # Data rows
+    for row in quality_data:
+        var = _escape_latex(str(row.get('Variable', '')))
+        typ = _escape_latex(str(row.get('Type', '')))
+        missing = str(row.get('Missing (%)', ''))
+        unique = str(row.get('Unique', ''))
+        dominant = _escape_latex(str(row.get('Dominant value (%)', '')))
+        mean = str(row.get('Mean (if numeric)', ''))
+
+        # Format mean to 2 decimals if it's numeric
+        if mean != '' and mean != '' and mean != 'nan':
+            try:
+                mean = f"{float(mean):.2f}"
+            except:
+                pass
+
+        latex.append(f"{var} & {typ} & {missing} & {unique} & {dominant} & {mean} \\\\")
+
+    # End tabular
+    latex.append("\\bottomrule")
+    latex.append("\\end{tabular}")
+    latex.append("\\end{adjustbox}")
+    latex.append("\\end{table}")
+
+    return "\n".join(latex)
+
+
+def generate_dataset_quality_subsection(quality_data: List[Dict[str, Any]], filename: str = "") -> str:
+    """
+    Generate a complete subsection with interpretation for Dataset Quality Summary.
+
+    This can be inserted into the Results section of a LaTeX report.
+
+    Args:
+        quality_data: Dataset quality summary data
+        filename: Optional dataset filename
+
+    Returns:
+        LaTeX subsection code with table and interpretation
+    """
+    if not quality_data:
+        return ""
+
+    latex = []
+
+    # Subsection header
+    latex.append("\\subsection{Dataset Structure and Quality Summary}")
+    latex.append("")
+
+    # Interpretive paragraph
+    n_vars = len(quality_data)
+
+    # Count variable types
+    type_counts = {}
+    for row in quality_data:
+        var_type = row.get('Type', 'Unknown')
+        type_counts[var_type] = type_counts.get(var_type, 0) + 1
+
+    # Count quality issues
+    has_missing = sum(1 for row in quality_data if row.get('Missing (%)', 0) > 0)
+    low_cardinality_numerics = sum(1 for row in quality_data
+                                   if row.get('Type') == 'Numeric' and row.get('Unique', 999) <= 10)
+
+    # Build interpretation paragraph
+    latex.append(f"Table~\\ref{{tab:dataset_quality}} presents the dataset structure and quality summary for {n_vars} variables. ")
+
+    type_desc = []
+    for vtype, count in sorted(type_counts.items()):
+        type_desc.append(f"{count} {vtype.lower()}")
+    if type_desc:
+        latex.append(f"The dataset comprises {', '.join(type_desc)} variables. ")
+
+    if has_missing > 0:
+        latex.append(f"{has_missing} variable(s) contain missing data. ")
+    else:
+        latex.append("No missing data were observed across all variables. ")
+
+    if low_cardinality_numerics > 0:
+        latex.append(f"{low_cardinality_numerics} numeric variable(s) exhibit low cardinality ($\\leq$10 unique values), suggesting possible ordinal encoding considerations. ")
+
+    latex.append("")
+    latex.append("")
+
+    # Generate the table
+    latex.append(generate_dataset_quality_latex_table(quality_data, filename))
+    latex.append("")
+
+    return "\n".join(latex)

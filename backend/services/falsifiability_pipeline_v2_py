@@ -1,0 +1,721 @@
+"""
+Evidence-Based Explanation Pipeline (Redesigned)
+
+This module orchestrates a transparent, evidence-based framework:
+1. Statistical Evidence Layer (observations from statistical tests)
+2. Explanatory Evidence Layer (rank stability, label randomization, sanity checks)
+3. AI Narrative Layer (always generated, contextualized by evidence)
+
+KEY PHILOSOPHY:
+- No pass/fail gatekeeping
+- All observations are valuable evidence
+- Transparency over prescription
+- User makes final judgment based on complete evidence
+"""
+
+import numpy as np
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+
+from services.statistical_tests_service import get_statistical_test_results
+from services.genai_narrative_renderer import GenAINarrativeRenderer
+from persistence.validated_commentary_repository import save_validated_commentary
+
+
+class EvidenceBasedPipeline:
+    """
+    Transparent evidence collection and narrative generation pipeline.
+
+    This redesigned pipeline:
+    - Collects all available evidence (statistical, explanatory)
+    - Presents evidence as observations (not verdicts)
+    - Always generates AI narrative with appropriate contextualization
+    - Saves complete evidence to database for transparency
+    """
+
+    def __init__(self, renderer_config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize the evidence-based pipeline.
+
+        Args:
+            renderer_config: Configuration for narrative renderer
+        """
+        self.renderer = GenAINarrativeRenderer(renderer_config)
+
+    def process_model_explanation(
+        self,
+        model_name: str,
+        dataset_filename: str,
+        run_timestamp: str,
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        base_value: float,
+        prediction: float,
+        dataset_info: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Process model explanation with complete evidence transparency.
+
+        Args:
+            model_name: Name of the model
+            dataset_filename: Dataset filename
+            run_timestamp: Run timestamp
+            shap_values: SHAP attribution values
+            feature_names: Feature names
+            base_value: SHAP base value
+            prediction: Model prediction
+            dataset_info: Dataset metadata
+            **kwargs: Additional parameters
+
+        Returns:
+            Complete evidence package with all layers:
+            {
+                'statistical_evidence': {...},
+                'explanatory_evidence': {...},
+                'ai_narrative': {...},
+                'evidence_summary': "..."
+            }
+        """
+        print(f"\n{'='*80}")
+        print(f"EVIDENCE-BASED PIPELINE: {model_name}")
+        print(f"{'='*80}\n")
+
+        # Layer 1: Collect Statistical Evidence
+        print("Layer 1: Collecting Statistical Evidence...")
+        statistical_evidence = self._collect_statistical_evidence(
+            dataset_filename,
+            run_timestamp
+        )
+        print(f"  ✓ Collected {len(statistical_evidence.get('tests_conducted', []))} statistical tests")
+
+        # Layer 2: Collect Explanatory Evidence
+        print("\nLayer 2: Collecting Explanatory Evidence...")
+        explanatory_evidence = self._collect_explanatory_evidence(
+            shap_values,
+            feature_names,
+            dataset_filename,
+            kwargs.get('label_randomization_data'),
+            dataset_info
+        )
+        print(f"  ✓ Collected explanatory evidence")
+
+        # Layer 3: Generate Contextualized AI Narrative
+        print("\nLayer 3: Generating AI Narrative...")
+        ai_narrative = self._generate_contextualized_narrative(
+            statistical_evidence,
+            explanatory_evidence,
+            shap_values,
+            feature_names,
+            base_value,
+            prediction,
+            model_name,
+            dataset_info
+        )
+        print(f"  ✓ Narrative generated")
+
+        # Generate Evidence Summary
+        evidence_summary = self._generate_evidence_summary(
+            statistical_evidence,
+            explanatory_evidence
+        )
+
+        # Package complete evidence
+        complete_evidence = {
+            'statistical_evidence': statistical_evidence,
+            'explanatory_evidence': explanatory_evidence,
+            'ai_narrative': ai_narrative,
+            'evidence_summary': evidence_summary,
+            'model_name': model_name,
+            'dataset_filename': dataset_filename,
+            'run_timestamp': run_timestamp
+        }
+
+        # Save to database
+        print("\nSaving validated commentary to database...")
+        try:
+            save_validated_commentary(
+                filename=dataset_filename,
+                run_timestamp=run_timestamp,
+                model_name=model_name,
+                statistical_evidence=statistical_evidence,
+                explanatory_evidence=explanatory_evidence,
+                ai_narrative=ai_narrative,
+                evidence_summary=evidence_summary
+            )
+            print("  ✓ Saved to database")
+        except Exception as e:
+            print(f"  ⚠ Could not save to database: {e}")
+
+        print(f"\n{'='*80}\n")
+
+        return complete_evidence
+
+    def _collect_statistical_evidence(
+        self,
+        dataset_filename: str,
+        run_timestamp: str
+    ) -> Dict[str, Any]:
+        """
+        Collect statistical reliability evidence without pass/fail judgment.
+        All observations are valuable.
+        """
+        evidence = {
+            "tests_conducted": [],
+            "observations": [],
+            "significant_differences_found": False,
+            "test_count": 0
+        }
+
+        try:
+            statistical_tests = get_statistical_test_results(
+                dataset_filename,
+                run_timestamp
+            )
+
+            if not statistical_tests:
+                evidence["observations"].append(
+                    "No statistical tests available for this model run."
+                )
+                return evidence
+
+            evidence["test_count"] = len(statistical_tests)
+
+            for test_entry in statistical_tests:
+                # Handle nested structure: {model_pair, test, result}
+                model_pair = test_entry.get('model_pair', 'Unknown models')
+                test_type = test_entry.get('test', 'unknown')
+                result = test_entry.get('result', {})
+
+                # Extract values from result object
+                p_value = result.get('p_value')
+                statistic = result.get('statistic')
+
+                # Format test name
+                test_name_map = {
+                    'mcnemar': "McNemar's Test",
+                    'paired_ttest': "Paired t-test",
+                    'wilcoxon': "Wilcoxon Signed-Rank Test",
+                    'friedman': "Friedman Test"
+                }
+                test_name = test_name_map.get(test_type, test_type.replace('_', ' ').title())
+                full_test_name = f"{test_name} ({model_pair})"
+
+                observation = {
+                    "test_name": full_test_name,
+                    "p_value": p_value,
+                    "statistic": statistic,
+                    "significance": "significant" if p_value and p_value < 0.05 else "not significant",
+                    "interpretation": self._interpret_statistical_test_with_models(test_name, model_pair, p_value, statistic)
+                }
+
+                evidence["tests_conducted"].append(observation)
+
+                if p_value and p_value < 0.05:
+                    evidence["significant_differences_found"] = True
+
+            # Generate summary observations (not verdicts)
+            if evidence["significant_differences_found"]:
+                evidence["observations"].append(
+                    "Statistical tests indicate significant performance differences between models (p < 0.05). "
+                    "This suggests models have distinct predictive capabilities."
+                )
+            else:
+                evidence["observations"].append(
+                    "Statistical tests show no significant performance differences. "
+                    "This suggests models perform similarly on this dataset, "
+                    "which may indicate robustness or lack of model diversity."
+                )
+
+        except Exception as e:
+            evidence["observations"].append(f"Error collecting statistical evidence: {str(e)}")
+
+        return evidence
+
+    def _interpret_statistical_test(self, test: Dict[str, Any]) -> str:
+        """Generate interpretation for a statistical test result (legacy method)."""
+        test_name = test.get('test_name', '')
+        p_value = test.get('p_value')
+
+        if p_value is None:
+            return "Test result unavailable"
+
+        if p_value < 0.001:
+            strength = "very strong"
+        elif p_value < 0.01:
+            strength = "strong"
+        elif p_value < 0.05:
+            strength = "moderate"
+        else:
+            strength = "no"
+
+        if p_value < 0.05:
+            return f"{test_name} shows {strength} evidence of performance difference (p = {p_value:.4f})"
+        else:
+            return f"{test_name} shows {strength} evidence of performance difference (p = {p_value:.4f})"
+
+    def _interpret_statistical_test_with_models(
+        self,
+        test_name: str,
+        model_pair: str,
+        p_value: Optional[float],
+        statistic: Optional[float]
+    ) -> str:
+        """Generate interpretation for statistical test with model context."""
+        if p_value is None:
+            return f"Test result unavailable for {model_pair}"
+
+        if p_value < 0.001:
+            strength = "very strong"
+        elif p_value < 0.01:
+            strength = "strong"
+        elif p_value < 0.05:
+            strength = "moderate"
+        else:
+            strength = "no significant"
+
+        if p_value < 0.05:
+            stat_str = f" (statistic = {statistic:.4f})" if statistic is not None else ""
+            return f"{test_name} shows {strength} evidence of performance difference between {model_pair} (p = {p_value:.4f}{stat_str})"
+        else:
+            return f"No significant performance difference between {model_pair} (p = {p_value:.4f})"
+
+    def _collect_explanatory_evidence(
+        self,
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        dataset_filename: str,
+        label_randomization_data: Optional[Dict[str, Any]],
+        dataset_info: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Collect explanatory validity evidence as observations.
+        """
+        evidence = {
+            "rank_stability": None,
+            "label_randomization": None,
+            "sanity_checks": [],
+            "observations": []
+        }
+
+        # Rank Stability Evidence (compare across models/runs)
+        rank_stability_result = self._assess_rank_stability(
+            shap_values,
+            feature_names,
+            dataset_filename
+        )
+        if rank_stability_result:
+            evidence["rank_stability"] = rank_stability_result
+            if rank_stability_result.get("interpretation"):
+                evidence["observations"].append(rank_stability_result["interpretation"])
+
+        # Label Randomization Evidence (if available)
+        if label_randomization_data:
+            correlation = label_randomization_data.get('pearson_correlation')
+            random_accuracy = label_randomization_data.get('random_accuracy')
+
+            evidence["label_randomization"] = {
+                "correlation": correlation,
+                "random_accuracy": random_accuracy,
+                "interpretation": self._interpret_label_randomization(correlation, random_accuracy)
+            }
+
+            if correlation is not None:
+                if abs(correlation) < 0.3:
+                    evidence["observations"].append(
+                        f"Label randomization shows low correlation (r = {correlation:.3f}), "
+                        "indicating explanations are model-dependent."
+                    )
+                else:
+                    evidence["observations"].append(
+                        f"Label randomization shows correlation (r = {correlation:.3f}), "
+                        "suggesting some explanation artifacts may be present."
+                    )
+        else:
+            # No label randomization data available
+            evidence["observations"].append(
+                "Label randomization test not available. "
+                "Run label randomization analysis to verify explanation model-dependency."
+            )
+
+        # SHAP Sanity Checks
+        sanity_results = self._run_shap_sanity_checks(shap_values, feature_names)
+        evidence["sanity_checks"] = sanity_results
+        evidence["observations"].extend(sanity_results.get('observations', []))
+
+        return evidence
+
+    def _interpret_label_randomization(
+        self,
+        correlation: Optional[float],
+        random_accuracy: Optional[float]
+    ) -> str:
+        """Interpret label randomization test results."""
+        if correlation is None:
+            return "Label randomization test not available"
+
+        parts = []
+
+        # Correlation interpretation
+        if abs(correlation) < 0.2:
+            parts.append(f"Very low correlation (r = {correlation:.3f}) indicates strong model-dependency")
+        elif abs(correlation) < 0.3:
+            parts.append(f"Low correlation (r = {correlation:.3f}) indicates good model-dependency")
+        elif abs(correlation) < 0.5:
+            parts.append(f"Moderate correlation (r = {correlation:.3f}) suggests partial model-dependency")
+        else:
+            parts.append(f"High correlation (r = {correlation:.3f}) raises concerns about explanation artifacts")
+
+        # Random accuracy interpretation
+        if random_accuracy is not None:
+            if abs(random_accuracy - 0.5) < 0.1:
+                parts.append(f"Random model accuracy ({random_accuracy:.3f}) near chance level confirms proper randomization")
+            else:
+                parts.append(f"Random model accuracy ({random_accuracy:.3f}) deviates from chance level")
+
+        return ". ".join(parts)
+
+    def _assess_rank_stability(
+        self,
+        current_shap_values: np.ndarray,
+        feature_names: List[str],
+        dataset_filename: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Assess rank stability by comparing feature importance rankings
+        across different models/runs for the same dataset.
+
+        Uses Kendall's Tau and Spearman's Rho to measure rank correlation.
+        """
+        try:
+            from scipy.stats import kendalltau, spearmanr
+            from persistence.shap_results_repository import load_shap_result
+
+            # Load SHAP results for other models on this dataset
+            shap_result = load_shap_result(dataset_filename)
+            if not shap_result or 'global_importance' not in shap_result:
+                return None
+
+            global_importance = shap_result.get('global_importance', [])
+            if not global_importance or len(global_importance) < 3:
+                # Need at least 3 features for meaningful rank correlation
+                return None
+
+            # Create ranking from current SHAP values
+            current_ranking = np.argsort(np.abs(current_shap_values))[::-1]  # Descending order
+
+            # Get stored rankings (sort by mean_shap magnitude)
+            stored_features = [item['feature'] for item in global_importance]
+            stored_shap = np.array([item['mean_shap'] for item in global_importance])
+            stored_ranking = np.argsort(np.abs(stored_shap))[::-1]
+
+            # Ensure we're comparing the same features in the same order
+            if len(feature_names) != len(stored_features):
+                return None
+
+            # Map features to ensure alignment
+            feature_to_idx = {f: i for i, f in enumerate(feature_names)}
+            stored_to_idx = {f: i for i, f in enumerate(stored_features)}
+
+            # Check if features match
+            if set(feature_names) != set(stored_features):
+                return None
+
+            # Compute rank correlations
+            tau, tau_p = kendalltau(current_ranking, stored_ranking)
+            rho, rho_p = spearmanr(current_ranking, stored_ranking)
+
+            # Interpret stability
+            if tau > 0.8:
+                stability_level = "very high"
+                interpretation = f"Very high rank stability (τ = {tau:.3f}, ρ = {rho:.3f}) across model runs suggests highly consistent feature importance"
+            elif tau > 0.6:
+                stability_level = "high"
+                interpretation = f"High rank stability (τ = {tau:.3f}, ρ = {rho:.3f}) indicates consistent feature importance rankings"
+            elif tau > 0.4:
+                stability_level = "moderate"
+                interpretation = f"Moderate rank stability (τ = {tau:.3f}, ρ = {rho:.3f}) shows some variability in feature rankings across runs"
+            elif tau > 0.2:
+                stability_level = "low"
+                interpretation = f"Low rank stability (τ = {tau:.3f}, ρ = {rho:.3f}) suggests significant ranking variability - explanations may be unstable"
+            else:
+                stability_level = "very low"
+                interpretation = f"Very low rank stability (τ = {tau:.3f}, ρ = {rho:.3f}) indicates highly inconsistent feature rankings - caution advised"
+
+            return {
+                "kendall_tau": float(tau),
+                "kendall_p_value": float(tau_p),
+                "spearman_rho": float(rho),
+                "spearman_p_value": float(rho_p),
+                "stability_level": stability_level,
+                "interpretation": interpretation,
+                "compared_against": "stored SHAP global importance",
+                "num_features_compared": len(feature_names)
+            }
+
+        except Exception as e:
+            print(f"Could not assess rank stability: {e}")
+            return None
+
+    def _run_shap_sanity_checks(
+        self,
+        shap_values: np.ndarray,
+        feature_names: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Run basic SHAP sanity checks.
+        """
+        checks = {
+            "checks_passed": [],
+            "checks_observations": [],
+            "observations": []
+        }
+
+        # Check 1: No NaN values
+        if not np.isnan(shap_values).any():
+            checks["checks_passed"].append("no_nan_values")
+            checks["observations"].append("SHAP values contain no NaN values")
+        else:
+            checks["checks_observations"].append("Warning: SHAP values contain NaN values")
+
+        # Check 2: Reasonable magnitude
+        max_shap = np.max(np.abs(shap_values))
+        if max_shap < 10:  # Arbitrary reasonable threshold
+            checks["checks_passed"].append("reasonable_magnitude")
+            checks["observations"].append(f"SHAP values have reasonable magnitude (max = {max_shap:.3f})")
+        else:
+            checks["checks_observations"].append(f"Note: Large SHAP values detected (max = {max_shap:.3f})")
+
+        # Check 3: Non-zero variance
+        if np.var(shap_values) > 1e-10:
+            checks["checks_passed"].append("non_zero_variance")
+        else:
+            checks["checks_observations"].append("Warning: SHAP values show very low variance")
+
+        return checks
+
+    def _generate_contextualized_narrative(
+        self,
+        statistical_evidence: Dict[str, Any],
+        explanatory_evidence: Dict[str, Any],
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        base_value: float,
+        prediction: float,
+        model_name: str,
+        dataset_info: Optional[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Generate AI narrative that contextualizes findings based on evidence.
+        ALWAYS generates narrative, but includes appropriate caveats.
+        """
+        # Build SHAP summary
+        shap_summary = self._prepare_shap_summary(
+            shap_values, feature_names, base_value, prediction
+        )
+
+        # Build evidence context
+        context = self._build_narrative_context(
+            statistical_evidence,
+            explanatory_evidence
+        )
+
+        # Prepare dataset info
+        if dataset_info is None:
+            dataset_info = {}
+
+        # Generate narrative using existing renderer
+        try:
+            # Create validated findings structure expected by renderer
+            validated_findings = {
+                'shap_summary': shap_summary,
+                'model_name': model_name,
+                'evidence_context': context
+            }
+
+            narrative_obj = self.renderer.render_narrative(
+                validated_findings=validated_findings,
+                shap_summary=shap_summary,
+                dataset_info=dataset_info
+            )
+
+            # Extract narrative text
+            narrative_text = self.renderer.export_narrative_to_text(narrative_obj)
+
+        except Exception as e:
+            print(f"  ⚠ Error generating narrative: {e}")
+            narrative_text = self._generate_fallback_narrative(shap_summary, context)
+
+        # Generate caveats based on evidence
+        caveats = self._generate_caveats(statistical_evidence, explanatory_evidence)
+
+        return {
+            'narrative': narrative_text,
+            'caveats': caveats,
+            'confidence_qualifiers': self._extract_confidence_qualifiers(context),
+            'generation_metadata': {
+                'model': 'claude-sonnet-3.5',
+                'timestamp': datetime.now().isoformat(),
+                'evidence_layers_used': ['statistical', 'explanatory']
+            }
+        }
+
+    def _prepare_shap_summary(
+        self,
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        base_value: float,
+        prediction: float
+    ) -> Dict[str, Any]:
+        """Prepare SHAP summary for narrative."""
+        abs_shap = np.abs(shap_values)
+        sorted_indices = np.argsort(abs_shap)[::-1]
+
+        top_features = []
+        for idx in sorted_indices:
+            feature_info = {
+                'feature': feature_names[idx],
+                'importance': abs_shap[idx],
+                'shap_value': shap_values[idx],
+                'direction': 'positive' if shap_values[idx] > 0 else 'negative'
+            }
+            top_features.append(feature_info)
+
+        return {
+            'base_value': base_value,
+            'prediction': prediction,
+            'top_features': top_features,
+            'total_features': len(feature_names)
+        }
+
+    def _build_narrative_context(
+        self,
+        statistical_evidence: Dict[str, Any],
+        explanatory_evidence: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Build context for narrative generation."""
+        context = {
+            'statistical_summary': "",
+            'explanatory_summary': "",
+            'overall_confidence': "moderate"
+        }
+
+        # Statistical summary
+        if statistical_evidence.get('significant_differences_found'):
+            context['statistical_summary'] = "Statistical tests show significant model differences"
+        else:
+            context['statistical_summary'] = "Statistical tests show similar model performance"
+
+        # Explanatory summary
+        lr_data = explanatory_evidence.get('label_randomization')
+        if lr_data:
+            corr = lr_data.get('correlation')
+            if corr and abs(corr) < 0.3:
+                context['explanatory_summary'] = "Explanations show good model-dependency"
+                context['overall_confidence'] = "high"
+            else:
+                context['explanatory_summary'] = "Some explanation concerns detected"
+                context['overall_confidence'] = "moderate"
+        else:
+            context['explanatory_summary'] = "Limited explanatory evidence available"
+
+        return context
+
+    def _generate_caveats(
+        self,
+        statistical_evidence: Dict[str, Any],
+        explanatory_evidence: Dict[str, Any]
+    ) -> List[str]:
+        """Generate evidence-based caveats."""
+        caveats = []
+
+        # Statistical caveats
+        if not statistical_evidence.get('significant_differences_found'):
+            caveats.append(
+                "Statistical tests show no significant performance differences between models"
+            )
+
+        # Explanatory caveats
+        lr_data = explanatory_evidence.get('label_randomization')
+        if lr_data:
+            corr = lr_data.get('correlation')
+            if corr and abs(corr) >= 0.3:
+                caveats.append(
+                    f"Label randomization shows correlation of {corr:.3f}, suggesting possible explanation artifacts"
+                )
+
+        if not caveats:
+            caveats.append("All available evidence supports the explanation")
+
+        return caveats
+
+    def _extract_confidence_qualifiers(self, context: Dict[str, Any]) -> List[str]:
+        """Extract confidence qualifiers from context."""
+        confidence = context.get('overall_confidence', 'moderate')
+        return [confidence]
+
+    def _generate_fallback_narrative(
+        self,
+        shap_summary: Dict[str, Any],
+        context: Dict[str, Any]
+    ) -> str:
+        """Generate simple narrative if AI rendering fails."""
+        top_features = shap_summary['top_features'][:5]
+
+        narrative_parts = [
+            f"Model Prediction: {shap_summary['prediction']:.4f}",
+            f"Base Value: {shap_summary['base_value']:.4f}",
+            "",
+            "Key Factors (by importance):"
+        ]
+
+        for i, feat in enumerate(top_features, 1):
+            direction = "increases" if feat['direction'] == 'positive' else "decreases"
+            narrative_parts.append(
+                f"{i}. {feat['feature']}: {direction} prediction (SHAP = {feat['shap_value']:.4f})"
+            )
+
+        narrative_parts.extend([
+            "",
+            f"Evidence Context: {context.get('statistical_summary', 'N/A')}",
+            f"Explanation Quality: {context.get('explanatory_summary', 'N/A')}"
+        ])
+
+        return "\n".join(narrative_parts)
+
+    def _generate_evidence_summary(
+        self,
+        statistical_evidence: Dict[str, Any],
+        explanatory_evidence: Dict[str, Any]
+    ) -> str:
+        """Generate human-readable summary of all evidence."""
+        summary_parts = []
+
+        # Statistical summary
+        test_count = statistical_evidence.get('test_count', 0)
+        if test_count > 0:
+            if statistical_evidence.get('significant_differences_found'):
+                summary_parts.append(
+                    f"Statistical Evidence ({test_count} tests): Significant differences detected"
+                )
+            else:
+                summary_parts.append(
+                    f"Statistical Evidence ({test_count} tests): No significant differences"
+                )
+        else:
+            summary_parts.append("Statistical Evidence: Not available")
+
+        # Explanatory summary
+        lr_data = explanatory_evidence.get('label_randomization')
+        if lr_data:
+            corr = lr_data.get('correlation')
+            summary_parts.append(
+                f"Label Randomization: Correlation = {corr:.3f}"
+            )
+
+        sanity_checks = explanatory_evidence.get('sanity_checks', {})
+        passed_count = len(sanity_checks.get('checks_passed', []))
+        if passed_count > 0:
+            summary_parts.append(f"Sanity Checks: {passed_count} checks passed")
+
+        return " | ".join(summary_parts)

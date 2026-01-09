@@ -1,0 +1,187 @@
+"""
+LaTeX Generator for Label Randomization Test Results.
+
+Generates publication-ready LaTeX sections for the label randomization
+sanity check (Adebayo et al. 2018).
+"""
+
+import numpy as np
+from typing import Dict, Any, Optional
+
+
+def _escape_latex(text: str) -> str:
+    """Escape special LaTeX characters."""
+    if not isinstance(text, str):
+        text = str(text)
+
+    text = text.replace('\\', r'\textbackslash{}')
+    replacements = {
+        '&': r'\&', '%': r'\%', '$': r'\$', '#': r'\#',
+        '_': r'\_', '{': r'\{', '}': r'\}', '~': r'\textasciitilde{}',
+        '^': r'\^{}', '<': r'\textless{}', '>': r'\textgreater{}',
+        '|': r'\textbar{}',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _format_metric(value: float, decimals: int = 4) -> str:
+    """Format metric value for LaTeX."""
+    if value is None:
+        return 'N/A'
+    return f"{value:.{decimals}f}"
+
+
+def generate_label_randomization_section(
+    label_randomization_result: Dict[str, Any],
+    original_shap_values: Optional[np.ndarray] = None
+) -> str:
+    """
+    Generate LaTeX section for label randomization test results.
+
+    Args:
+        label_randomization_result: Result from label randomization test
+        original_shap_values: Original SHAP values for comparison (optional)
+
+    Returns:
+        LaTeX section content
+    """
+    if not label_randomization_result:
+        return ""
+
+    latex = []
+
+    # Section header
+    latex.append(r"\subsection{Label Randomization Test (Sanity Check)}")
+    latex.append("")
+
+    # Introduction
+    latex.append(r"The label randomization test validates that SHAP explanations")
+    latex.append(r"are indeed model-dependent and not producing spurious patterns. A model trained on")
+    latex.append(r"randomized labels should perform near chance level, and its explanations should differ")
+    latex.append(r"significantly from the original model's explanations.")
+    latex.append("")
+
+    # Extract data
+    random_accuracy = label_randomization_result.get('random_accuracy', 0.0)
+    randomized_shap = np.array(label_randomization_result.get('randomized_shap_values', []))
+    feature_names = label_randomization_result.get('feature_names', [])
+    base_value = label_randomization_result.get('base_value', 0.0)
+    n_test_samples = label_randomization_result.get('n_test_samples', 0)
+    model_type = label_randomization_result.get('model_type', 'Unknown')
+
+    # Summary table
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Label Randomization Test Summary}")
+    latex.append(r"\label{tab:label_randomization_summary}")
+    latex.append(r"\begin{tabular}{ll}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Metric} & \textbf{Value} \\")
+    latex.append(r"\midrule")
+    latex.append(f"Random Model Type & {_escape_latex(model_type)} \\\\")
+    latex.append(f"Random Model Accuracy & {_format_metric(random_accuracy, 4)} \\\\")
+    latex.append(r"Expected Accuracy (Random) & $\approx 0.50$ \\")
+    latex.append(f"Base Value (Intercept) & {_format_metric(base_value, 4)} \\\\")
+    latex.append(f"Number of Test Samples & {n_test_samples} \\\\")
+    latex.append(f"Number of Features & {len(feature_names)} \\\\")
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    # Interpretation
+    if abs(random_accuracy - 0.5) < 0.1:
+        verdict = r"\textbf{PASS}"
+        interpretation = "The random model achieves near-chance accuracy, confirming labels were properly randomized."
+    else:
+        verdict = r"\textbf{WARNING}"
+        interpretation = f"The random model achieves {_format_metric(random_accuracy, 4)} accuracy, which deviates from expected chance level (0.50)."
+
+    latex.append(r"\textbf{Verdict:} " + verdict)
+    latex.append("")
+    latex.append(interpretation)
+    latex.append("")
+
+    # Feature-wise SHAP comparison table (if original SHAP available)
+    if original_shap_values is not None and len(original_shap_values) == len(randomized_shap):
+        latex.append(r"\subsubsection{SHAP Value Comparison: Original vs. Randomized}")
+        latex.append("")
+
+        # Calculate differences
+        differences = np.abs(original_shap_values - randomized_shap)
+
+        # Create comparison table
+        latex.append(r"\begin{table}[H]")
+        latex.append(r"\centering")
+        latex.append(r"\caption{SHAP Values: Original Model vs. Random Label Model}")
+        latex.append(r"\label{tab:shap_comparison_randomization}")
+        latex.append(r"\resizebox{\textwidth}{!}{%")
+        latex.append(r"\begin{tabular}{lrrr}")
+        latex.append(r"\toprule")
+        latex.append(r"\textbf{Feature} & \textbf{Original SHAP} & \textbf{Random SHAP} & \textbf{Absolute Difference} \\")
+        latex.append(r"\midrule")
+
+        # Sort by absolute difference (descending)
+        sorted_indices = np.argsort(differences)[::-1]
+
+        for idx in sorted_indices[:15]:  # Show top 15 features
+            feature = _escape_latex(str(feature_names[idx]))
+            orig_val = _format_metric(original_shap_values[idx], 4)
+            rand_val = _format_metric(randomized_shap[idx], 4)
+            diff_val = _format_metric(differences[idx], 4)
+
+            latex.append(f"{feature} & {orig_val} & {rand_val} & {diff_val} \\\\")
+
+        if len(feature_names) > 15:
+            latex.append(r"\midrule")
+            latex.append(f"\\multicolumn{{4}}{{c}}{{... and {len(feature_names) - 15} more features}} \\\\")
+
+        latex.append(r"\bottomrule")
+        latex.append(r"\end{tabular}")
+        latex.append(r"}")
+        latex.append(r"\end{table}")
+        latex.append("")
+
+        # Calculate similarity metrics
+        from scipy.stats import pearsonr
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        correlation, p_value = pearsonr(original_shap_values, randomized_shap)
+        cos_sim = cosine_similarity(
+            original_shap_values.reshape(1, -1),
+            randomized_shap.reshape(1, -1)
+        )[0, 0]
+
+        # Similarity metrics table
+        latex.append(r"\begin{table}[H]")
+        latex.append(r"\centering")
+        latex.append(r"\caption{Similarity Metrics: Original vs. Randomized SHAP}")
+        latex.append(r"\label{tab:shap_similarity_metrics}")
+        latex.append(r"\begin{tabular}{lr}")
+        latex.append(r"\toprule")
+        latex.append(r"\textbf{Metric} & \textbf{Value} \\")
+        latex.append(r"\midrule")
+        latex.append(f"Pearson Correlation & {_format_metric(correlation, 4)} \\\\")
+        latex.append(f"P-value & {_format_metric(p_value, 4)} \\\\")
+        latex.append(f"Cosine Similarity & {_format_metric(cos_sim, 4)} \\\\")
+        latex.append(r"\bottomrule")
+        latex.append(r"\end{tabular}")
+        latex.append(r"\end{table}")
+        latex.append("")
+
+        # Interpretation
+        if abs(correlation) < 0.3:
+            verdict = r"\textbf{PASS}"
+            interpretation = "Low correlation indicates original and randomized explanations are distinct, as expected."
+        else:
+            verdict = r"\textbf{WARNING}"
+            interpretation = f"High correlation ({_format_metric(correlation, 4)}) suggests explanations may not be sufficiently model-dependent."
+
+        latex.append(r"\textbf{Verdict:} " + verdict)
+        latex.append("")
+        latex.append(interpretation)
+        latex.append("")
+
+    return "\n".join(latex)

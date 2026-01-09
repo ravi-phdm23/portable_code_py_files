@@ -1,0 +1,27 @@
+
+from datetime import datetime
+
+def parse_run_timestamp(ts_str: str) -> datetime:
+    """
+    Helper to parse run timestamp from frontend, handling 'Z' and timezone offsets
+    to ensure naive datetime for DB comparison.
+    """
+    if not ts_str:
+        return None
+        
+    if ts_str.endswith('Z'):
+        # If it ends with Z, it's UTC. We remove it to make it naive 
+        # because our DB stores naive timestamps from datetime.now()
+        ts_str = ts_str.replace('Z', '')
+    
+    if '+' in ts_str:
+        ts_str = ts_str.split('+')[0]
+        
+    try:
+        return datetime.fromisoformat(ts_str)
+    except ValueError:
+        try:
+            # Try parsing without microseconds if that's the issue
+            return datetime.strptime(ts_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+        except:
+            return None

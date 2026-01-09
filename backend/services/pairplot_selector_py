@@ -1,0 +1,291 @@
+"""
+Intelligent pairplot variable selection service.
+Selects appropriate quantitative variables for pairplot axes.
+"""
+
+import numpy as np
+import pandas as pd
+from typing import Tuple, List
+
+
+def calculate_normalized_entropy(series: pd.Series) -> float:
+    """
+    Calculate normalized entropy for a series.
+
+    Normalized entropy ranges from 0 (completely uniform or single value)
+    to 1 (maximum entropy for the given number of unique values).
+
+    Args:
+        series: Pandas series
+
+    Returns:
+        Normalized entropy value between 0 and 1
+    """
+    nunique = series.nunique()
+
+    if nunique <= 1:
+        return 0.0
+
+    value_counts = series.value_counts()
+    probabilities = value_counts / len(series)
+
+    # Shannon entropy
+    entropy = -np.sum(probabilities * np.log2(probabilities))
+
+    # Maximum possible entropy for this number of unique values
+    max_entropy = np.log2(nunique)
+
+    # Normalize to [0, 1]
+    normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+
+    return normalized_entropy
+
+
+def classify_column(series: pd.Series, col_name: str) -> str:
+    """
+    Classify a numeric column by its information type.
+
+    Args:
+        series: Pandas series to classify
+        col_name: Column name
+
+    Returns:
+        Classification: 'quantitative', 'low_entropy_numeric', or 'categorical'
+    """
+    nunique = series.nunique()
+    col_range = series.max() - series.min()
+    norm_entropy = calculate_normalized_entropy(series)
+
+    # Binary or ternary variables
+    if nunique <= 3:
+        return 'low_entropy_numeric'
+
+    # Very small range (essentially constant)
+    if col_range < 1.0:
+        return 'low_entropy_numeric'
+
+    # Low unique values with low entropy (categorical nature)
+    if nunique < 10 and norm_entropy < 0.5:
+        return 'categorical'
+
+    # Everything else is quantitative
+    return 'quantitative'
+
+
+def select_pairplot_variables(
+    df: pd.DataFrame,
+    target_column: str = 'target',
+    min_vars: int = 2,
+    max_vars: int = 10
+) -> Tuple[List[str], str, List[str], dict]:
+    """
+    Select appropriate variables for pairplot visualization.
+
+    This function identifies quantitative variables suitable for pairplot axes
+    by excluding low-entropy numeric and categorical variables that do not
+    support meaningful geometric relationships (correlation, spread, distribution).
+
+    Args:
+        df: DataFrame containing the data
+        target_column: Name of the target/hue column (default: 'target')
+        min_vars: Minimum number of axis variables required (default: 2)
+        max_vars: Maximum number of axis variables to include (default: 10)
+
+    Returns:
+        Tuple containing:
+        - axis_vars: List of column names suitable for pairplot axes
+        - hue_var: Name of hue variable (target column)
+        - excluded_vars: List of excluded column names with reasons
+        - metadata: Dict with detailed classification information
+    """
+    axis_vars = []
+    excluded_vars = []
+    metadata = {
+        'classifications': {},
+        'statistics': {}
+    }
+
+    # Get numeric columns (exclude target)
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+
+    if target_column in numeric_cols:
+        numeric_cols.remove(target_column)
+
+    # Classify each column
+    for col in numeric_cols:
+        nunique = df[col].nunique()
+        col_min = df[col].min()
+        col_max = df[col].max()
+        col_range = col_max - col_min
+        norm_entropy = calculate_normalized_entropy(df[col])
+
+        # Store statistics
+        metadata['statistics'][col] = {
+            'unique_values': int(nunique),
+            'min': float(col_min),
+            'max': float(col_max),
+            'range': float(col_range),
+            'normalized_entropy': float(norm_entropy),
+            'mean': float(df[col].mean()),
+            'std': float(df[col].std())
+        }
+
+        # Classify
+        classification = classify_column(df[col], col)
+        metadata['classifications'][col] = classification
+
+        if classification == 'quantitative':
+            axis_vars.append(col)
+        else:
+            excluded_vars.append({
+                'column': col,
+                'reason': classification,
+                'unique_values': nunique,
+                'normalized_entropy': norm_entropy
+            })
+
+    # Sort quantitative variables by entropy (most informative first)
+    # This helps prioritize the most valuable variables if we need to limit
+    axis_vars_sorted = sorted(
+        axis_vars,
+        key=lambda col: metadata['statistics'][col]['normalized_entropy'],
+        reverse=True
+    )
+
+    # Limit to max_vars if specified
+    if len(axis_vars_sorted) > max_vars:
+        excess_vars = axis_vars_sorted[max_vars:]
+        axis_vars_sorted = axis_vars_sorted[:max_vars]
+
+        for col in excess_vars:
+            excluded_vars.append({
+                'column': col,
+                'reason': 'exceeded_max_limit',
+                'unique_values': metadata['statistics'][col]['unique_values'],
+                'normalized_entropy': metadata['statistics'][col]['normalized_entropy']
+            })
+
+    # Validate minimum variables
+    if len(axis_vars_sorted) < min_vars:
+        metadata['warning'] = (
+            f"Only {len(axis_vars_sorted)} quantitative variables found. "
+            f"Minimum {min_vars} required for pairplot."
+        )
+
+    # Validate target column
+    hue_var = None
+    if target_column in df.columns:
+        target_nunique = df[target_column].nunique()
+        if target_nunique > 10:
+            metadata['warning'] = (
+                f"Target column '{target_column}' has {target_nunique} unique values. "
+                f"Consider binning or using top categories for clearer visualization."
+            )
+        hue_var = target_column
+    else:
+        metadata['warning'] = f"Target column '{target_column}' not found in dataset."
+
+    return axis_vars_sorted, hue_var, excluded_vars, metadata
+
+
+def get_pairplot_selection_report(
+    axis_vars: List[str],
+    hue_var: str,
+    excluded_vars: List[dict],
+    metadata: dict
+) -> str:
+    """
+    Generate a human-readable report of pairplot variable selection.
+
+    Args:
+        axis_vars: Selected axis variables
+        hue_var: Hue variable
+        excluded_vars: Excluded variables with reasons
+        metadata: Metadata from selection process
+
+    Returns:
+        Formatted string report
+    """
+    report = []
+    report.append("=" * 80)
+    report.append("PAIRPLOT VARIABLE SELECTION REPORT")
+    report.append("=" * 80)
+    report.append("")
+
+    # Selected variables
+    report.append(f"SELECTED AXIS VARIABLES ({len(axis_vars)}):")
+    report.append("")
+    for col in axis_vars:
+        stats = metadata['statistics'][col]
+        report.append(
+            f"  • {col}: {stats['unique_values']} unique values, "
+            f"range [{stats['min']:.2f}, {stats['max']:.2f}], "
+            f"entropy={stats['normalized_entropy']:.3f}"
+        )
+    report.append("")
+
+    # Hue variable
+    if hue_var:
+        report.append(f"HUE VARIABLE: {hue_var}")
+    else:
+        report.append("HUE VARIABLE: None (not found)")
+    report.append("")
+
+    # Excluded variables
+    if excluded_vars:
+        report.append(f"EXCLUDED VARIABLES ({len(excluded_vars)}):")
+        report.append("")
+
+        # Group by reason
+        by_reason = {}
+        for item in excluded_vars:
+            reason = item['reason']
+            if reason not in by_reason:
+                by_reason[reason] = []
+            by_reason[reason].append(item)
+
+        for reason, items in by_reason.items():
+            report.append(f"  {reason.replace('_', ' ').title()}:")
+            for item in items:
+                report.append(
+                    f"    - {item['column']}: {item['unique_values']} unique values, "
+                    f"entropy={item['normalized_entropy']:.3f}"
+                )
+            report.append("")
+
+    # Warnings
+    if 'warning' in metadata:
+        report.append("WARNINGS:")
+        report.append(f"  {metadata['warning']}")
+        report.append("")
+
+    report.append("=" * 80)
+
+    return "\n".join(report)
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Test with Australian Credit dataset
+    import os
+
+    # Adjust path as needed
+    dataset_path = os.path.join('..', '..', 'sample_datasets', 'Australian Credit.csv')
+
+    if os.path.exists(dataset_path):
+        df = pd.read_csv(dataset_path)
+
+        axis_vars, hue_var, excluded, metadata = select_pairplot_variables(
+            df,
+            target_column='target',
+            max_vars=10
+        )
+
+        report = get_pairplot_selection_report(axis_vars, hue_var, excluded, metadata)
+        print(report)
+
+        print("\nPairplot Configuration:")
+        print(f"  columns = {axis_vars + [hue_var]}")
+        print(f"  hue = '{hue_var}'")
+    else:
+        print(f"Dataset not found at: {dataset_path}")

@@ -1,0 +1,405 @@
+"""
+Model execution service.
+Pure ML computation - implements model groups with clear naming.
+"""
+
+import pandas as pd
+import numpy as np
+import time
+import warnings
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, recall_score, brier_score_loss, roc_curve
+from imblearn.over_sampling import SMOTE
+from services.model_registry import (
+    get_model_config,
+    validate_model_selection,
+    map_legacy_model_name,
+    MODEL_REGISTRY
+)
+
+# Suppress specific ML library warnings
+warnings.filterwarnings('ignore', message='.*Stochastic Optimizer.*')
+warnings.filterwarnings('ignore', message='.*No further splits with positive gain.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.neural_network')
+warnings.filterwarnings('ignore', category=UserWarning, module='lightgbm')
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+warnings.filterwarnings('ignore', category=FutureWarning, module='torch')
+
+
+def calculate_ks_statistic(y_true, y_pred_proba):
+    """
+    Calculate Kolmogorov-Smirnov statistic.
+    KS = max|TPR(t) - FPR(t)| across all thresholds.
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_pred_proba)
+    ks = np.max(np.abs(tpr - fpr))
+    return ks
+
+
+def calculate_partial_gini(y_true, y_pred_proba, delta=0.1):
+    """
+    Calculate Partial Gini coefficient.
+    PG measures local discrimination in conservative decision regions.
+    PG = 2 × AUC(p<δ) - 1
+
+    Args:
+        y_true: True labels
+        y_pred_proba: Predicted probabilities
+        delta: Threshold for conservative region (default 0.1)
+    """
+    # Filter to conservative region (low predicted probabilities)
+    mask = y_pred_proba < delta
+    if mask.sum() < 2:
+        # Not enough samples in conservative region
+        return 0.0
+
+    try:
+        auc_conservative = roc_auc_score(y_true[mask], y_pred_proba[mask])
+        pg = 2 * auc_conservative - 1
+        return pg
+    except:
+        return 0.0
+
+
+def calculate_h_measure(y_true, y_pred_proba, cost_ratio=1.0):
+    """
+    Calculate Hand's H-measure.
+    H = 1 - EMC/EMC₀
+
+    Utility-based, cost-sensitive alternative to AUC.
+    Measures the expected minimum cost relative to random classifier.
+
+    Args:
+        y_true: True labels
+        y_pred_proba: Predicted probabilities
+        cost_ratio: Ratio of cost(FN) to cost(FP), default 1.0
+    """
+    # Get ROC curve points
+    fpr, tpr, thresholds = roc_curve(y_true, y_pred_proba)
+
+    # Calculate prevalence
+    prevalence = np.mean(y_true)
+
+    # Calculate costs for each threshold
+    # Cost = FPR * (1-prevalence) * cost_FP + FNR * prevalence * cost_FN
+    # Normalized: cost_FP = 1, cost_FN = cost_ratio
+    fnr = 1 - tpr
+    costs = fpr * (1 - prevalence) + fnr * prevalence * cost_ratio
+
+    # Minimum cost achieved by classifier
+    emc = np.min(costs)
+
+    # Expected minimum cost of random classifier (baseline)
+    # For balanced case, EMC₀ = 0.5 * (cost_FP + cost_FN) * min(prevalence, 1-prevalence)
+    emc_0 = min(prevalence * cost_ratio, (1 - prevalence))
+
+    # H-measure
+    if emc_0 > 0:
+        h = 1 - (emc / emc_0)
+    else:
+        h = 0.0
+
+    return max(0.0, min(1.0, h))  # Clamp to [0, 1]
+
+
+def run_models(df, selected_features, target_column='target', use_smote=False, selected_models=None, selected_model_groups=None, progress_callback=None):
+    """
+    Execute models with group-based selection and proper naming.
+
+    Args:
+        df: DataFrame with all columns
+        selected_features: List of feature column names to use
+        target_column: Name of target column (default: 'target')
+        use_smote: Boolean, whether to apply SMOTE
+        selected_models: DEPRECATED - List of legacy model IDs (for backward compatibility)
+        selected_model_groups: Dict mapping group names to list of variant names
+            Example: {
+                "Logistic Regression": ["Logistic Regression (L2, LBFGS)"],
+                "Regularized Logistic Regression": ["Regularized Logistic Regression (ElasticNet, SAGA)"]
+            }
+        progress_callback: Optional callback function for progress updates
+            Signature: progress_callback(event_type: str, **kwargs)
+            Event types:
+            - 'model_started': {group: str, model: str, total: int, completed: int}
+            - 'model_completed': {group: str, model: str, result: dict, total: int, completed: int}
+
+    Returns:
+        dict with all_models, best_models_by_group, and benchmark_model
+    """
+    # Handle backward compatibility: convert legacy model names to new structure
+    if selected_model_groups is None and selected_models is not None:
+        selected_model_groups = {}
+        for legacy_name in selected_models:
+            mapping = map_legacy_model_name(legacy_name)
+            group = mapping["group"]
+            variant = mapping["variant"]
+            if group not in selected_model_groups:
+                selected_model_groups[group] = []
+            selected_model_groups[group].append(variant)
+
+    # Default to all available models if nothing specified
+    if selected_model_groups is None:
+        selected_model_groups = {
+            "Logistic Regression": [
+                "LR-LBFGS",
+                "LR-SAGA",
+                "LR-Newton"
+            ],
+            "Regularized Logistic Regression": [
+                "LR-Reg-SAGA",
+                "LR-Reg-LBFGS",
+                "LR-Reg-Liblinear"
+            ]
+        }
+
+    # Validate model selection
+    validate_model_selection(selected_model_groups)
+    # Validate inputs
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in DataFrame")
+    
+    missing_features = [f for f in selected_features if f not in df.columns]
+    if missing_features:
+        raise ValueError(f"Selected features not found in DataFrame: {missing_features}")
+    
+    if len(selected_features) == 0:
+        raise ValueError("No features selected")
+    
+    # Separate features and target
+    X = df[selected_features].copy()
+    y = df[target_column].copy()
+    
+    # Train-test split (stratified)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.25,
+        stratify=y,
+        random_state=42
+    )
+    
+    # Preprocessing pipeline
+    numeric_cols = X.select_dtypes(include=['number']).columns.tolist()
+    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+    
+    # Cast categorical columns to string
+    for col in categorical_cols:
+        X_train[col] = X_train[col].astype(str)
+        X_test[col] = X_test[col].astype(str)
+    
+    numeric_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    categorical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+    ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_pipeline, numeric_cols),
+            ('cat', categorical_pipeline, categorical_cols)
+        ]
+    )
+    
+    # Fit and transform
+    X_train_processed = preprocessor.fit_transform(X_train)
+    X_test_processed = preprocessor.transform(X_test)
+
+    # Build transformed feature names and mapping to base features
+    feature_names = []
+    base_features = []
+
+    feature_names.extend(numeric_cols)
+    base_features.extend(numeric_cols)
+
+    if categorical_cols:
+        cat_transformer = preprocessor.named_transformers_['cat']
+        onehot_encoder = cat_transformer.named_steps['onehot']
+        cat_feature_names = onehot_encoder.get_feature_names_out(categorical_cols)
+        feature_names.extend(cat_feature_names)
+        for fname in cat_feature_names:
+            matched_base = None
+            for col in categorical_cols:
+                if fname.startswith(f"{col}_") or fname.startswith(f"{col}="):
+                    matched_base = col
+                    break
+            if matched_base is None and len(categorical_cols) > 0:
+                matched_base = categorical_cols[0]
+            base_features.append(matched_base)
+
+    # Expand selected base features into transformed column names used by the model
+    transformed_selected = []
+    feat_set = set(feature_names)
+    for sf in selected_features:
+        if sf in feat_set:
+            transformed_selected.append(sf)
+        else:
+            # treat as base feature: include all transformed cols whose base matches sf
+            for fname, base in zip(feature_names, base_features):
+                if base == sf:
+                    transformed_selected.append(fname)
+
+    # Remove duplicates preserving order
+    seen = set()
+    transformed_selected_unique = []
+    for f in transformed_selected:
+        if f not in seen:
+            transformed_selected_unique.append(f)
+            seen.add(f)
+
+    # Calculate total number of models that will be executed
+    total_models = sum(len(variants) if variants else len(MODEL_REGISTRY.get(group_name, []))
+                       for group_name, variants in selected_model_groups.items())
+
+    # Execute models group by group
+    all_models = []
+    completed_count = 0
+
+    for group_name, variant_names in selected_model_groups.items():
+        # If variant_names is empty or None, select all variants in the group
+        if not variant_names:
+            if group_name in MODEL_REGISTRY:
+                variant_names = MODEL_REGISTRY[group_name]
+            else:
+                print(f"Warning: Model group '{group_name}' not found in registry")
+                continue
+
+        for variant_name in variant_names:
+            # Notify progress: model started
+            if progress_callback:
+                progress_callback('model_started', group=group_name, model=variant_name,
+                                total=total_models, completed=completed_count)
+
+            # Track execution time
+            start_time = time.time()
+            execution_success = True
+            error_message = None
+
+            try:
+                # Get model configuration from registry
+                config = get_model_config(group_name, variant_name)
+
+                # Instantiate model with configured parameters
+                model = config["model_class"](**config["params"])
+
+                # Apply calibration
+                calibrated_model = CalibratedClassifierCV(
+                    model,
+                    method=config["calibration"]["method"],
+                    cv=config["calibration"]["cv"]
+                )
+
+                # Create full pipeline (preprocessor + calibrated model)
+                full_pipeline = Pipeline([
+                    ('preprocessor', preprocessor),
+                    ('classifier', calibrated_model)
+                ])
+
+                # Train (using original data, pipeline handles preprocessing)
+                full_pipeline.fit(X_train, y_train)
+
+                # Predict (using full pipeline on original test data)
+                y_pred = full_pipeline.predict(X_test)
+                y_pred_proba = full_pipeline.predict_proba(X_test)[:, 1]
+
+                # Compute metrics
+                metrics = {
+                    'AUC': float(roc_auc_score(y_test, y_pred_proba)),
+                    'PCC': float(accuracy_score(y_test, y_pred)),
+                    'F1': float(f1_score(y_test, y_pred, average='weighted')),
+                    'Recall': float(recall_score(y_test, y_pred, average='weighted')),
+                    'BS': float(brier_score_loss(y_test, y_pred_proba)),
+                    'KS': float(calculate_ks_statistic(y_test, y_pred_proba)),
+                    'PG': float(calculate_partial_gini(y_test, y_pred_proba)),
+                    'H': float(calculate_h_measure(y_test, y_pred_proba))
+                }
+            except Exception as e:
+                execution_success = False
+                error_message = str(e)
+                metrics = None
+
+            # Calculate execution time
+            execution_time = time.time() - start_time
+
+            # Store result with full naming and execution metadata
+            model_result = {
+                'model_group': group_name,
+                'model_name': variant_name,
+                'metrics': metrics,
+                'is_best_in_group': False,  # Will be set later
+                'execution_time': round(execution_time, 1),  # Time in seconds with 1 decimal
+                'execution_success': execution_success,
+                'error_message': error_message,
+                'trained_model': full_pipeline if execution_success else None  # NEW: Include full pipeline
+            }
+
+            all_models.append(model_result)
+            completed_count += 1
+
+            # Notify progress: model completed
+            if progress_callback:
+                # Create a copy of model_result without trained_model for progress callback
+                # (can't serialize sklearn models to JSON for streaming)
+                progress_result = {k: v for k, v in model_result.items() if k != 'trained_model'}
+                progress_callback('model_completed', group=group_name, model=variant_name,
+                                result=progress_result, total=total_models, completed=completed_count)
+
+    # Compute best model within each group (by AUC)
+    best_models_by_group = {}
+    for group_name in selected_model_groups.keys():
+        group_models = [m for m in all_models if m['model_group'] == group_name and m['execution_success']]
+        if group_models:
+            best_model = max(group_models, key=lambda m: m['metrics']['AUC'])
+            best_model['is_best_in_group'] = True
+            best_models_by_group[group_name] = {
+                'model_name': best_model['model_name'],
+                'metrics': best_model['metrics']
+            }
+
+    # Compute global benchmark model (best across all groups)
+    benchmark_model = None
+    successful_models = [m for m in all_models if m['execution_success']]
+    if successful_models:
+        global_best = max(successful_models, key=lambda m: m['metrics']['AUC'])
+        benchmark_model = {
+            'model_group': global_best['model_group'],
+            'model_name': global_best['model_name'],
+            'metrics': global_best['metrics']
+        }
+
+    # Legacy results format for backward compatibility
+    legacy_results = []
+    for model in all_models:
+        # Map back to legacy names if possible
+        legacy_name = None
+        if model['model_name'] == "LR-LBFGS":
+            legacy_name = "LR"
+        elif model['model_name'] == "LR-Reg-SAGA":
+            legacy_name = "LR-Reg"
+
+        if legacy_name:
+            legacy_results.append({
+                'model': legacy_name,
+                'metrics': model['metrics']
+            })
+
+    return {
+        # New structured format
+        'all_models': all_models,
+        'best_models_by_group': best_models_by_group,
+        'benchmark_model': benchmark_model,
+        # Legacy format for backward compatibility
+        'dataset': df.attrs.get('filename', 'unknown'),
+        'use_smote': use_smote,
+        'features_used': selected_features,
+        'selected_features_transformed': transformed_selected_unique,
+        'results': legacy_results if legacy_results else all_models
+    }

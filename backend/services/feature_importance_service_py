@@ -1,0 +1,179 @@
+"""
+Feature importance calculation service.
+Pure ML computation - no Flask, no database, no file I/O.
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from imblearn.over_sampling import RandomOverSampler
+from config import MISSING_THRESHOLD, TEST_SIZE, RANDOM_STATE, RF_N_ESTIMATORS, RF_MAX_DEPTH, LR_C, LR_MAX_ITER
+
+
+def calculate_feature_importance(df):
+    """
+    Calculate feature importance using RandomForest and LogisticRegression L1.
+    Follows the exact algorithm specification.
+
+    Returns dict with:
+        - rf_table: DataFrame with feature and rf_score
+        - lr_table: DataFrame with feature and lr_score
+        - merged_table: DataFrame with all scores, normalized, ranked
+        - feature_names: list of feature names
+    """
+    # Step 1: Input Validation
+    if 'target' not in df.columns:
+        raise ValueError("Required column 'target' not found in DataFrame")
+
+    # Step 2: Separate Target and Features
+    y = df['target']
+    X = df.drop(columns=['target'])
+
+    # Step 3: Drop High-Missing Columns
+    missing_ratios = X.isna().mean()
+    columns_to_keep = missing_ratios[missing_ratios <= MISSING_THRESHOLD].index.tolist()
+    X = X[columns_to_keep]
+
+    if X.empty:
+        raise ValueError("No features remain after dropping high-missing columns")
+
+    # Step 4: Preprocessing Pipeline
+    numeric_cols = X.select_dtypes(include=['number']).columns.tolist()
+    categorical_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    numeric_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='mean')),
+        ('scaler', MinMaxScaler())
+    ])
+
+    categorical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore'))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_pipeline, numeric_cols),
+            ('cat', categorical_pipeline, categorical_cols)
+        ]
+    )
+
+    # Fit and transform to get feature names
+    X_transformed = preprocessor.fit_transform(X)
+
+    # Step 5: Feature Name Expansion (for one-hot encoded categorical features)
+    feature_names = []
+    base_features = []
+
+    # Numeric features keep their original names
+    feature_names.extend(numeric_cols)
+    base_features.extend(numeric_cols)
+
+    # Categorical features - get one-hot encoded names and map to base feature
+    if categorical_cols:
+        # Get the OneHotEncoder from the categorical pipeline
+        cat_transformer = preprocessor.named_transformers_['cat']
+        onehot_encoder = cat_transformer.named_steps['onehot']
+
+        # Get one-hot encoded feature names
+        cat_feature_names = onehot_encoder.get_feature_names_out(categorical_cols)
+        feature_names.extend(cat_feature_names)
+
+        # Map each one-hot name back to its base categorical column by prefix match
+        for fname in cat_feature_names:
+            # Find the categorical column whose name is a prefix of the onehot feature
+            matched_base = None
+            for col in categorical_cols:
+                if fname.startswith(f"{col}_") or fname.startswith(f"{col}="):
+                    matched_base = col
+                    break
+            # Fallback: if no prefix match, set to first categorical column (defensive)
+            if matched_base is None and len(categorical_cols) > 0:
+                matched_base = categorical_cols[0]
+            base_features.append(matched_base)
+
+    # Step 6: Train/Test Split (Stratified)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_transformed, y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=y
+    )
+
+    # Step 7: Handle Class Imbalance
+    ros = RandomOverSampler(random_state=RANDOM_STATE)
+    X_train_balanced, y_train_balanced = ros.fit_resample(X_train, y_train)
+
+    # Step 8: RandomForest Selector
+    rf_model = RandomForestClassifier(
+        n_estimators=RF_N_ESTIMATORS,
+        max_depth=RF_MAX_DEPTH,
+        random_state=RANDOM_STATE
+    )
+    rf_model.fit(X_train_balanced, y_train_balanced)
+    rf_importances = rf_model.feature_importances_
+
+    rf_table = pd.DataFrame({
+        'feature': feature_names,
+        'base_feature': base_features,
+        'rf_score': rf_importances
+    })
+
+    # Step 9: LogisticRegression L1 Selector
+    lr_model = LogisticRegression(
+        penalty='l1',
+        solver='liblinear',
+        C=LR_C,
+        max_iter=LR_MAX_ITER,
+        random_state=RANDOM_STATE
+    )
+    lr_model.fit(X_train_balanced, y_train_balanced)
+
+    # For multi-class, take the mean of absolute coefficients
+    if len(lr_model.coef_.shape) > 1 and lr_model.coef_.shape[0] > 1:
+        lr_importances = np.abs(lr_model.coef_).mean(axis=0)
+    else:
+        lr_importances = np.abs(lr_model.coef_[0])
+
+    lr_table = pd.DataFrame({
+        'feature': feature_names,
+        'base_feature': base_features,
+        'lr_score': lr_importances
+    })
+
+    # Step 10: Merge and aggregate by base_feature
+    merged = pd.merge(rf_table, lr_table, on=['feature', 'base_feature'])
+
+    # Aggregate scores by base_feature (take mean of all one-hot variants)
+    aggregated = merged.groupby('base_feature').agg({
+        'rf_score': 'mean',
+        'lr_score': 'mean'
+    }).reset_index()
+
+    # Normalize scores to [0, 1]
+    aggregated['rf_score_norm'] = (aggregated['rf_score'] - aggregated['rf_score'].min()) / (aggregated['rf_score'].max() - aggregated['rf_score'].min() + 1e-10)
+    aggregated['lr_score_norm'] = (aggregated['lr_score'] - aggregated['lr_score'].min()) / (aggregated['lr_score'].max() - aggregated['lr_score'].min() + 1e-10)
+
+    # Average normalized scores
+    aggregated['avg_score'] = (aggregated['rf_score_norm'] + aggregated['lr_score_norm']) / 2
+
+    # Rank by avg_score
+    aggregated = aggregated.sort_values('avg_score', ascending=False).reset_index(drop=True)
+    aggregated['rank'] = range(1, len(aggregated) + 1)
+
+    # Prepare display table with feature column for checkbox selection
+    merged_table = aggregated[['rank', 'base_feature', 'rf_score', 'lr_score', 'rf_score_norm', 'lr_score_norm', 'avg_score']].copy()
+    merged_table['feature'] = merged_table['base_feature']  # For checkbox selection
+
+    return {
+        'rf_table': rf_table,
+        'lr_table': lr_table,
+        'merged_table': merged_table,
+        'feature_names': feature_names
+    }

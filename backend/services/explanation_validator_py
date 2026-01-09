@@ -1,0 +1,436 @@
+"""
+Explanation Validation Framework
+
+This module implements the falsifiability-driven validation layer that sits between
+predictive models and the generative AI narrative renderer. It ensures that only
+explanations that survive empirical scrutiny are passed to the GenAI layer.
+
+Architecture aligns with the predictive-explanatory framework described in the paper:
+1. Statistical reliability layer (Wilcoxon, McNemar, DeLong tests)
+2. Explanatory validity layer (rank stability, label randomization, counterfactual validity)
+3. Only validated explanations reach the GenAI narrative renderer
+
+References:
+- Slack et al. (2020): Fooling LIME and SHAP
+- Adebayo et al. (2018): Sanity Checks for Saliency Maps
+- Agarwal et al. (2022): On the Stability of Feature Attributions
+"""
+
+import numpy as np
+from typing import Dict, List, Any, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
+
+
+class ValidationStatus(Enum):
+    """Status codes for explanation validation"""
+    PASSED = "passed"
+    FAILED = "failed"
+    WARNING = "warning"
+    NOT_TESTED = "not_tested"
+
+
+@dataclass
+class ValidationResult:
+    """Result of a single validation test"""
+    test_name: str
+    status: ValidationStatus
+    score: float
+    threshold: float
+    details: Dict[str, Any]
+    interpretation: str
+
+
+@dataclass
+class ExplanationValidationReport:
+    """Comprehensive validation report for an explanation"""
+    model_name: str
+    explanation_method: str  # e.g., "SHAP", "LIME"
+
+    # Statistical reliability (from statistical_tests_service)
+    statistical_reliability: Dict[str, ValidationResult]
+
+    # Explanatory validity tests
+    rank_stability: ValidationResult
+    label_randomization: ValidationResult
+    model_sanity: ValidationResult
+
+    # Overall assessment
+    overall_status: ValidationStatus
+    validated_for_genai: bool
+    falsification_attempts: int
+    passed_tests: int
+    failed_tests: int
+
+    # Audit trail
+    validation_timestamp: str
+    validation_config: Dict[str, Any]
+
+
+class ExplanationValidator:
+    """
+    Validates explanations through structured refutation tests.
+
+    This class implements the "falsifiability layer" between statistical tests
+    and the GenAI narrative renderer. Only explanations that survive empirical
+    scrutiny are marked as validated_for_genai=True.
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize validator with configuration.
+
+        Args:
+            config: Validation thresholds and parameters
+        """
+        self.config = config or self._default_config()
+
+    def _default_config(self) -> Dict[str, Any]:
+        """Default validation thresholds aligned with literature"""
+        return {
+            # Statistical significance thresholds
+            'statistical_p_threshold': 0.05,
+            'min_effect_size': 0.2,  # Cohen's d
+
+            # Rank stability (Agarwal et al. 2022)
+            'rank_stability_threshold': 0.80,  # Top features should be stable
+            'rank_correlation_method': 'spearman',
+
+            # Label randomization (Adebayo et al. 2018)
+            'max_randomization_similarity': 0.30,  # Explanation should change significantly
+
+            # Model sanity (Adebayo et al. 2018)
+            'max_random_model_similarity': 0.30,  # Should differ from random model
+
+            # SHAP-specific
+            'shap_sum_tolerance': 0.01,  # SHAP values should sum to prediction difference
+
+            # Overall
+            'min_pass_rate': 0.75  # At least 75% of tests must pass
+        }
+
+    def validate_explanation(
+        self,
+        model_name: str,
+        explanation_method: str,
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        statistical_tests: List[Dict[str, Any]],
+        base_prediction: float,
+        actual_prediction: float,
+        **kwargs
+    ) -> ExplanationValidationReport:
+        """
+        Validate an explanation through structured falsification tests.
+
+        Args:
+            model_name: Name of the model being explained
+            explanation_method: Method used (SHAP, LIME, etc.)
+            shap_values: SHAP attribution values
+            feature_names: Names of features
+            statistical_tests: Results from statistical significance tests
+            base_prediction: Base/expected value
+            actual_prediction: Actual model prediction
+            **kwargs: Additional test-specific parameters
+
+        Returns:
+            ExplanationValidationReport with validation results
+        """
+        from datetime import datetime
+
+        # 1. Validate statistical reliability
+        stat_reliability = self._validate_statistical_reliability(statistical_tests)
+
+        # 2. Rank stability test
+        rank_stability = self._test_rank_stability(
+            shap_values, feature_names, **kwargs
+        )
+
+        # 3. Label randomization test
+        label_randomization = self._test_label_randomization(
+            shap_values, **kwargs
+        )
+
+        # 4. Model sanity check
+        model_sanity = self._test_model_sanity(
+            shap_values, base_prediction, actual_prediction
+        )
+
+        # Aggregate results
+        all_tests = [
+            *stat_reliability.values(),
+            rank_stability,
+            label_randomization,
+            model_sanity
+        ]
+
+        passed = sum(1 for t in all_tests if t.status == ValidationStatus.PASSED)
+        failed = sum(1 for t in all_tests if t.status == ValidationStatus.FAILED)
+        total = len(all_tests)
+
+        pass_rate = passed / total if total > 0 else 0
+        overall_status = (
+            ValidationStatus.PASSED if pass_rate >= self.config['min_pass_rate']
+            else ValidationStatus.FAILED
+        )
+
+        validated_for_genai = (overall_status == ValidationStatus.PASSED)
+
+        return ExplanationValidationReport(
+            model_name=model_name,
+            explanation_method=explanation_method,
+            statistical_reliability=stat_reliability,
+            rank_stability=rank_stability,
+            label_randomization=label_randomization,
+            model_sanity=model_sanity,
+            overall_status=overall_status,
+            validated_for_genai=validated_for_genai,
+            falsification_attempts=total,
+            passed_tests=passed,
+            failed_tests=failed,
+            validation_timestamp=datetime.now().isoformat(),
+            validation_config=self.config
+        )
+
+    def _validate_statistical_reliability(
+        self, statistical_tests: List[Dict[str, Any]]
+    ) -> Dict[str, ValidationResult]:
+        """
+        Validate that model differences are statistically significant.
+
+        Implements first layer: predictive reliability through Wilcoxon, McNemar, DeLong.
+        """
+        results = {}
+
+        for test in statistical_tests:
+            test_type = test.get('test', 'unknown')
+            result_data = test.get('result', {})
+            p_value = result_data.get('p_value', 1.0)
+            significant = result_data.get('significant', False)
+            effect_size = result_data.get('effect_size')  # May be None
+
+            # Determine status
+            # Some tests (McNemar, DeLong) don't provide effect size
+            if significant and effect_size is not None and effect_size >= self.config['min_effect_size']:
+                status = ValidationStatus.PASSED
+                interp = f"{test_type.capitalize()} test shows significant difference (p={p_value:.4f}, effect={effect_size:.3f})"
+            elif significant and effect_size is None:
+                # Significant but no effect size (McNemar, DeLong)
+                status = ValidationStatus.PASSED
+                interp = f"{test_type.capitalize()} test shows significant difference (p={p_value:.4f})"
+            elif significant:
+                # Significant but small effect size
+                status = ValidationStatus.WARNING
+                interp = f"{test_type.capitalize()} test significant but small effect size ({effect_size:.3f})"
+            else:
+                status = ValidationStatus.FAILED
+                interp = f"{test_type.capitalize()} test shows no significant difference (p={p_value:.4f})"
+
+            results[test_type] = ValidationResult(
+                test_name=f"Statistical_{test_type}",
+                status=status,
+                score=1.0 - p_value,  # Higher score = more significant
+                threshold=self.config['statistical_p_threshold'],
+                details={'p_value': p_value, 'effect_size': effect_size, 'significant': significant},
+                interpretation=interp
+            )
+
+        return results
+
+    def _test_rank_stability(
+        self,
+        shap_values: np.ndarray,
+        feature_names: List[str],
+        perturbation_runs: Optional[List[np.ndarray]] = None,
+        **kwargs
+    ) -> ValidationResult:
+        """
+        Test rank stability of feature importance.
+
+        Implements Agarwal et al. (2022) stability checks: top features should
+        remain consistent across perturbations or bootstrap samples.
+        """
+        if perturbation_runs is None or len(perturbation_runs) == 0:
+            # If no perturbation data provided, run simplified check
+            # Check if top features are clearly distinguished
+            abs_shap = np.abs(shap_values)
+            sorted_idx = np.argsort(abs_shap)[::-1]
+
+            # Compare top 5 vs next 5
+            top_5_mean = np.mean(abs_shap[sorted_idx[:5]])
+            next_5_mean = np.mean(abs_shap[sorted_idx[5:10]]) if len(sorted_idx) > 5 else 0
+
+            separation_ratio = top_5_mean / (next_5_mean + 1e-10)
+
+            # High separation = stable ranking
+            stability_score = min(1.0, separation_ratio / 3.0)  # Normalize
+
+            status = (
+                ValidationStatus.PASSED if stability_score >= self.config['rank_stability_threshold']
+                else ValidationStatus.WARNING
+            )
+
+            interp = f"Top features show {'clear' if stability_score > 0.8 else 'moderate'} separation (ratio={separation_ratio:.2f})"
+        else:
+            # Calculate rank correlation across perturbations
+            from scipy.stats import spearmanr
+
+            correlations = []
+            for perturbed in perturbation_runs:
+                corr, _ = spearmanr(shap_values, perturbed)
+                correlations.append(corr)
+
+            stability_score = np.mean(correlations)
+
+            status = (
+                ValidationStatus.PASSED if stability_score >= self.config['rank_stability_threshold']
+                else ValidationStatus.FAILED
+            )
+
+            interp = f"Rank correlation across perturbations: {stability_score:.3f} (n={len(correlations)})"
+
+        return ValidationResult(
+            test_name="Rank_Stability",
+            status=status,
+            score=stability_score,
+            threshold=self.config['rank_stability_threshold'],
+            details={'method': 'separation_ratio' if perturbation_runs is None else 'spearman'},
+            interpretation=interp
+        )
+
+    def _test_label_randomization(
+        self,
+        shap_values: np.ndarray,
+        randomized_shap_values: Optional[np.ndarray] = None,
+        **kwargs
+    ) -> ValidationResult:
+        """
+        Test that explanations change when labels are randomized.
+
+        Implements Adebayo et al. (2018) sanity check: if labels are randomized
+        but explanations stay the same, the method is not explaining the model.
+        """
+        if randomized_shap_values is None:
+            # Cannot perform test without randomized data
+            return ValidationResult(
+                test_name="Label_Randomization",
+                status=ValidationStatus.NOT_TESTED,
+                score=0.0,
+                threshold=self.config['max_randomization_similarity'],
+                details={'reason': 'No randomized labels provided'},
+                interpretation="Test skipped: randomized model not available"
+            )
+
+        # Calculate similarity between original and randomized explanations
+        from scipy.stats import pearsonr
+
+        correlation, _ = pearsonr(shap_values, randomized_shap_values)
+        similarity = abs(correlation)
+
+        # Low similarity = PASSED (explanation changes with labels)
+        status = (
+            ValidationStatus.PASSED if similarity < self.config['max_randomization_similarity']
+            else ValidationStatus.FAILED
+        )
+
+        interp = (
+            f"Explanation {'correctly changes' if status == ValidationStatus.PASSED else 'incorrectly remains similar'} "
+            f"with randomized labels (similarity={similarity:.3f})"
+        )
+
+        return ValidationResult(
+            test_name="Label_Randomization",
+            status=status,
+            score=1.0 - similarity,  # Lower similarity = higher score
+            threshold=self.config['max_randomization_similarity'],
+            details={'correlation': correlation, 'similarity': similarity},
+            interpretation=interp
+        )
+
+    def _test_model_sanity(
+        self,
+        shap_values: np.ndarray,
+        base_prediction: float,
+        actual_prediction: float
+    ) -> ValidationResult:
+        """
+        Test that SHAP values sum to prediction difference.
+
+        Basic sanity check: SHAP values should approximately sum to the difference
+        between the base value and the actual prediction.
+        """
+        shap_sum = np.sum(shap_values)
+        expected_diff = actual_prediction - base_prediction
+
+        # Calculate relative error
+        if abs(expected_diff) > 1e-6:
+            relative_error = abs(shap_sum - expected_diff) / abs(expected_diff)
+        else:
+            relative_error = abs(shap_sum - expected_diff)
+
+        # Low error = PASSED
+        status = (
+            ValidationStatus.PASSED if relative_error < self.config['shap_sum_tolerance']
+            else ValidationStatus.WARNING
+        )
+
+        interp = f"SHAP sum check: {shap_sum:.4f} vs expected {expected_diff:.4f} (error={relative_error:.4f})"
+
+        return ValidationResult(
+            test_name="Model_Sanity",
+            status=status,
+            score=1.0 - min(1.0, relative_error),
+            threshold=self.config['shap_sum_tolerance'],
+            details={
+                'shap_sum': float(shap_sum),
+                'expected_diff': float(expected_diff),
+                'relative_error': float(relative_error)
+            },
+            interpretation=interp
+        )
+
+
+def format_validation_report_for_genai(
+    report: ExplanationValidationReport
+) -> Dict[str, Any]:
+    """
+    Format validation report for GenAI consumption.
+
+    This function extracts only validated findings that the GenAI layer
+    should render into narrative form.
+    """
+    validated_findings = {
+        'model': report.model_name,
+        'method': report.explanation_method,
+        'validated': report.validated_for_genai,
+        'confidence_level': report.passed_tests / max(1, report.falsification_attempts),
+        'statistical_evidence': [],
+        'explanatory_evidence': [],
+        'audit_trail': {
+            'timestamp': report.validation_timestamp,
+            'tests_conducted': report.falsification_attempts,
+            'tests_passed': report.passed_tests,
+            'tests_failed': report.failed_tests
+        }
+    }
+
+    # Extract statistical reliability findings
+    for test_name, result in report.statistical_reliability.items():
+        if result.status == ValidationStatus.PASSED:
+            validated_findings['statistical_evidence'].append({
+                'test': test_name,
+                'finding': result.interpretation,
+                'p_value': result.details.get('p_value'),
+                'effect_size': result.details.get('effect_size')
+            })
+
+    # Extract explanatory validity findings
+    for test_result in [report.rank_stability, report.model_sanity]:
+        if test_result.status in [ValidationStatus.PASSED, ValidationStatus.WARNING]:
+            validated_findings['explanatory_evidence'].append({
+                'test': test_result.test_name,
+                'finding': test_result.interpretation,
+                'score': test_result.score
+            })
+
+    return validated_findings

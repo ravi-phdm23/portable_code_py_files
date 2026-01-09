@@ -1,0 +1,15 @@
+"""
+Validation utilities.
+Stateless helper functions for data validation.
+"""
+
+
+def detect_target_column(df):
+    """
+    Check if 'target' column exists (exact match, case-sensitive).
+    Returns 'target' if found, None otherwise.
+    No inference, guessing, or fallback logic allowed.
+    """
+    if 'target' in df.columns:
+        return 'target'
+    return None

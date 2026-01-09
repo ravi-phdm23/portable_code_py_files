@@ -1,0 +1,111 @@
+"""
+Exploratory Data Analysis (EDA) service.
+Pure computation functions for data analysis.
+No Flask, no database, no file I/O.
+"""
+
+import pandas as pd
+from config import MAX_TARGET_DISTRIBUTION_VALUES
+
+
+def generate_column_summary(df):
+    """
+    Generate column summary table.
+    Returns list of dicts with column statistics.
+    """
+    summary = []
+    total_rows = len(df)
+
+    for col in df.columns:
+        non_null_count = df[col].notna().sum()
+        null_count = df[col].isna().sum()
+
+        summary.append({
+            "column_name": col,
+            "data_type": str(df[col].dtype),
+            "total_rows": total_rows,
+            "non_null_count": int(non_null_count),
+            "null_count": int(null_count),
+            "percent_null": round((null_count / total_rows) * 100, 2),
+            "percent_non_null": round((non_null_count / total_rows) * 100, 2)
+        })
+
+    return summary
+
+
+def generate_describe_table(df):
+    """
+    Generate statistical summary using df.describe().
+    Returns dict with columns and rows.
+    Handles NaN values by converting them to None before JSON serialization.
+    """
+    numeric_df = df.select_dtypes(include=['number'])
+
+    if numeric_df.empty:
+        return None
+
+    describe_df = numeric_df.describe()
+
+    # Replace NaN values with None to make JSON-serializable
+    describe_df = describe_df.where(pd.notna(describe_df), None)
+
+    # Convert to JSON-friendly format
+    columns = describe_df.columns.tolist()
+    rows = []
+
+    for stat_name in describe_df.index:
+        row = {"metric": stat_name}
+        for col in columns:
+            value = describe_df.loc[stat_name, col]
+            # Value is already None or a valid float, just convert
+            if value is None:
+                row[col] = None
+            else:
+                row[col] = float(value)
+        rows.append(row)
+
+    return {
+        "columns": columns,
+        "rows": rows
+    }
+
+
+def generate_sample_data(df, n=5):
+    """
+    Get first n rows of dataframe.
+    Returns dict with columns and rows.
+    Converts NaN values to None for JSON serialization.
+    """
+    sample = df.head(n)
+
+    # Convert NaN to None for JSON serialization
+    sample = sample.where(pd.notna(sample), None)
+
+    return {
+        "columns": sample.columns.tolist(),
+        "rows": sample.values.tolist()
+    }
+
+
+def generate_target_distribution(df):
+    """
+    Calculate target column value distribution.
+    Returns dict with target_column name and distribution list.
+    Limited to top MAX_TARGET_DISTRIBUTION_VALUES.
+    """
+    if 'target' not in df.columns:
+        return None
+
+    value_counts = df['target'].value_counts().head(MAX_TARGET_DISTRIBUTION_VALUES)
+
+    distribution = []
+    for value, count in value_counts.items():
+        distribution.append({
+            "value": str(value),
+            "count": int(count)
+        })
+
+    return {
+        "target_column": "target",
+        "distribution": distribution
+    }

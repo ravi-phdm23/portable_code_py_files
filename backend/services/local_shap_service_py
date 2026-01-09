@@ -1,0 +1,411 @@
+"""
+Local SHAP Analysis Service.
+Provides single-row (instance-level) SHAP explanations with AI-generated commentary.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import shap
+from typing import Dict, Any, List, Optional, Tuple
+from datetime import datetime
+import os
+import json
+import hashlib
+
+from config import get_images_dir
+from services.shap_service import (
+    _split_pipeline,
+    _transform_data_for_explainer,
+    _make_explainer,
+    _p1_wrapper,
+    _infer_feature_names
+)
+from services.model_persistence import get_best_model_for_dataset
+
+
+def get_local_shap_explanation(
+    model,
+    X_train: pd.DataFrame,
+    row_data: pd.DataFrame,
+    row_index: int,
+    max_bg: int = 50
+) -> Tuple[np.ndarray, float, pd.DataFrame]:
+    """
+    Compute SHAP explanation for a single row.
+
+    Args:
+        model: Trained sklearn pipeline or model
+        X_train: Training data for background distribution
+        row_data: Single-row DataFrame to explain
+        row_index: Index of the row being explained
+        max_bg: Maximum background samples for explainer
+
+    Returns:
+        Tuple of (shap_values, base_value, explain_data)
+        - shap_values: Array of SHAP values for this instance
+        - base_value: Base/expected value
+        - explain_data: Transformed data used for explanation
+    """
+    feature_names = X_train.columns.tolist()
+
+    # Create background dataset
+    background_df = shap.sample(X_train, min(max_bg, len(X_train)), random_state=42)
+
+    # Create explainer
+    explainer = _make_explainer(model, background_df, feature_names)
+
+    # Transform the single row
+    explain_data = _transform_data_for_explainer(model, row_data)
+
+    # Get SHAP values
+    sv = explainer(explain_data)
+
+    if isinstance(sv, shap._explanation.Explanation):
+        shap_values = np.asarray(sv.values)
+        base_value = sv.base_values if hasattr(sv, 'base_values') else 0.0
+    else:
+        shap_values = np.asarray(sv)
+        base_value = 0.0
+
+    # Handle multi-output (should be single row)
+    if shap_values.ndim > 1:
+        shap_values = shap_values[0]
+
+    if isinstance(base_value, np.ndarray):
+        base_value = float(base_value[0])
+    else:
+        base_value = float(base_value)
+
+    return shap_values, base_value, explain_data
+
+
+def compute_single_row_reliability(
+    model,
+    X_train: pd.DataFrame,
+    row_data: pd.DataFrame,
+    n_trials: int = 5,
+    bg_size: int = 20
+) -> Dict[str, Any]:
+    """
+    Compute reliability metrics for a single-row SHAP explanation.
+
+    This tests the stability of SHAP values by:
+    1. Varying the background dataset (different samples)
+    2. Computing consistency of feature rankings
+    3. Measuring variance in SHAP values
+
+    Args:
+        model: Trained model
+        X_train: Training data
+        row_data: Single row to explain
+        n_trials: Number of trials with different backgrounds
+        bg_size: Background sample size per trial
+
+    Returns:
+        Dictionary with reliability metrics:
+        - feature_stability: Per-feature variance across trials
+        - ranking_stability: Ranking correlation across trials
+        - confidence_score: Overall confidence (0-1)
+    """
+    from sklearn.utils import check_random_state
+
+    rng = check_random_state(42)
+    feature_names = X_train.columns.tolist()
+
+    # Collect SHAP values from multiple trials
+    all_shap_values = []
+    all_rankings = []
+
+    for _ in range(n_trials):
+        bg = X_train.sample(min(bg_size, len(X_train)), random_state=rng.randint(1e9))
+        explainer = _make_explainer(model, bg, feature_names)
+        explain_data = _transform_data_for_explainer(model, row_data)
+        sv = explainer(explain_data)
+
+        if isinstance(sv, shap._explanation.Explanation):
+            values = np.asarray(sv.values)
+        else:
+            values = np.asarray(sv)
+
+        if values.ndim > 1:
+            values = values[0]
+
+        all_shap_values.append(values)
+
+        # Compute ranking (by absolute SHAP value)
+        abs_values = np.abs(values)
+        ranking = np.argsort(abs_values)[::-1]  # Descending order
+        all_rankings.append(ranking)
+
+    # Convert to arrays
+    shap_matrix = np.vstack(all_shap_values)  # shape: (n_trials, n_features)
+
+    # Compute per-feature statistics
+    mean_shap = shap_matrix.mean(axis=0)
+    std_shap = shap_matrix.std(axis=0)
+
+    # Compute coefficient of variation (normalized stability)
+    # Lower CV = more stable
+    cv = np.abs(std_shap / (mean_shap + 1e-10))
+
+    # Feature stability: 1 - normalized CV
+    max_cv = cv.max() if cv.max() > 0 else 1.0
+    feature_stability = 1.0 - (cv / max_cv)
+
+    # Ranking stability: average Spearman correlation between rankings
+    from scipy.stats import spearmanr
+
+    ranking_correlations = []
+    for i in range(len(all_rankings)):
+        for j in range(i + 1, len(all_rankings)):
+            corr, _ = spearmanr(all_rankings[i], all_rankings[j])
+            ranking_correlations.append(corr)
+
+    avg_ranking_correlation = np.mean(ranking_correlations) if ranking_correlations else 1.0
+
+    # Overall confidence score (weighted average)
+    confidence_score = 0.6 * avg_ranking_correlation + 0.4 * feature_stability.mean()
+
+    # Get inferred feature names (accounting for preprocessing)
+    preprocess, _ = _split_pipeline(model)
+    feature_names_final = _infer_feature_names(preprocess, feature_names, len(mean_shap))
+
+    return {
+        'mean_shap': mean_shap.tolist(),
+        'std_shap': std_shap.tolist(),
+        'feature_stability': feature_stability.tolist(),
+        'ranking_correlation': float(avg_ranking_correlation),
+        'confidence_score': float(confidence_score),
+        'feature_names': feature_names_final,
+        'n_trials': n_trials,
+        'bg_size': bg_size
+    }
+
+
+def generate_waterfall_plot(
+    shap_values: np.ndarray,
+    base_value: float,
+    feature_names: List[str],
+    feature_values: Dict[str, Any],
+    row_index: int,
+    filename: str,
+    predicted_prob: float
+) -> str:
+    """
+    Generate SHAP waterfall plot for a single instance.
+
+    Args:
+        shap_values: SHAP values for this instance
+        base_value: Base value (expected prediction)
+        feature_names: Names of features
+        feature_values: Actual feature values for this instance
+        row_index: Row index being explained
+        filename: Dataset filename
+        predicted_prob: Predicted probability
+
+    Returns:
+        Path to saved waterfall plot image
+    """
+    os.makedirs(get_images_dir(), exist_ok=True)
+
+    # Create unique filename
+    safe_filename = filename.replace('.csv', '')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plot_filename = f"{safe_filename}_row{row_index}_waterfall_{timestamp}.png"
+    plot_path = os.path.join(get_images_dir(), plot_filename)
+
+    # Ensure feature_names matches shap_values length
+    n_features = len(shap_values)
+    if len(feature_names) != n_features:
+        feature_names = feature_names[:n_features]
+
+    # Create feature value array aligned with shap_values
+    feature_value_array = np.zeros(n_features)
+    for i, fname in enumerate(feature_names):
+        if fname in feature_values:
+            try:
+                feature_value_array[i] = float(feature_values[fname])
+            except (ValueError, TypeError):
+                feature_value_array[i] = 0.0
+
+    # Create Explanation object for waterfall plot
+    explanation = shap.Explanation(
+        values=shap_values,
+        base_values=base_value,
+        data=feature_value_array,
+        feature_names=feature_names
+    )
+
+    # Generate waterfall plot
+    plt.figure(figsize=(10, max(6, len(feature_names) * 0.3)))
+    shap.plots.waterfall(explanation, max_display=15, show=False)
+    plt.title(f"SHAP Waterfall Plot - Row {row_index}\nPredicted P(Class=1) = {predicted_prob:.4f}",
+              fontsize=12, pad=20)
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    return f"/images/{plot_filename}"
+
+
+def analyze_single_row(
+    filename: str,
+    row_index: int,
+    run_timestamp: Optional[str] = None,
+    n_trials: int = 3,
+    bg_size: int = 30
+) -> Dict[str, Any]:
+    """
+    Main entry point for local SHAP analysis of a single row.
+
+    Args:
+        filename: Dataset filename
+        row_index: Index of row to analyze (0-based)
+        run_timestamp: Optional timestamp to load specific model run
+        n_trials: Number of trials for reliability testing
+        bg_size: Background sample size
+
+    Returns:
+        Dictionary with complete local SHAP analysis:
+        - row_data: Original feature values
+        - actual_target: True label
+        - predicted_prob: Predicted probability
+        - shap_values: SHAP values for each feature
+        - base_value: Expected prediction
+        - waterfall_plot: Path to waterfall plot
+        - reliability: Reliability metrics
+        - model_info: Information about the model used
+    """
+    from persistence.dataset_repository import load_csv_data
+
+    # Load dataset
+    df = load_csv_data(filename)
+    if df is None or df.empty:
+        raise ValueError(f"Dataset {filename} not found or empty")
+
+    # Validate row index
+    if row_index < 0 or row_index >= len(df):
+        raise ValueError(f"Row index {row_index} out of range (0-{len(df)-1})")
+
+    # Detect target column
+    from utils.validation import detect_target_column
+    target_column = detect_target_column(df)
+
+    # Get feature columns (exclude target)
+    all_columns = df.columns.tolist()
+    feature_columns = [col for col in all_columns if col != target_column]
+
+    # Get the specific row
+    row_data = df.iloc[[row_index]][feature_columns].copy()
+    actual_target = int(df.iloc[row_index][target_column])
+
+    # Prepare train/test split (for background)
+    from sklearn.model_selection import train_test_split
+    X = df[feature_columns].copy()
+    y = df[target_column].copy()
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.25, stratify=y, random_state=42
+    )
+
+    # Load best model
+    if run_timestamp:
+        result = get_best_model_for_dataset(filename, run_timestamp)
+    else:
+        result = get_best_model_for_dataset(filename)
+
+    if not result:
+        raise ValueError("No trained model found. Please run model training first.")
+
+    model, metadata = result
+
+    # Get prediction for this row
+    try:
+        predicted_prob = float(model.predict_proba(row_data)[:, 1][0])
+    except Exception as e:
+        raise ValueError(f"Failed to get prediction: {str(e)}")
+
+    # Get SHAP explanation
+    shap_values, base_value, explain_data = get_local_shap_explanation(
+        model, X_train, row_data, row_index
+    )
+
+    # Compute reliability metrics
+    reliability = compute_single_row_reliability(
+        model, X_train, row_data, n_trials=n_trials, bg_size=bg_size
+    )
+
+    # Get feature names (accounting for preprocessing)
+    preprocess, _ = _split_pipeline(model)
+    feature_names_final = _infer_feature_names(preprocess, feature_columns, len(shap_values))
+
+    # Build feature values dictionary for waterfall plot
+    feature_values = {}
+    for i, fname in enumerate(feature_names_final):
+        if i < len(feature_columns):
+            original_fname = feature_columns[i]
+            feature_values[fname] = row_data[original_fname].values[0]
+        else:
+            # Derived feature from preprocessing
+            if hasattr(explain_data, 'iloc'):
+                feature_values[fname] = explain_data.iloc[0, i] if i < explain_data.shape[1] else 0
+            else:
+                feature_values[fname] = explain_data[0, i] if i < explain_data.shape[1] else 0
+
+    # Generate waterfall plot
+    waterfall_plot_path = generate_waterfall_plot(
+        shap_values=shap_values,
+        base_value=base_value,
+        feature_names=feature_names_final,
+        feature_values=feature_values,
+        row_index=row_index,
+        filename=filename,
+        predicted_prob=predicted_prob
+    )
+
+    # Build SHAP contribution table
+    shap_contributions = []
+    for i, fname in enumerate(feature_names_final):
+        original_fname = feature_columns[i] if i < len(feature_columns) else fname
+        shap_contributions.append({
+            'feature': fname,
+            'original_feature': original_fname,
+            'value': feature_values.get(fname, None),
+            'shap_value': float(shap_values[i]),
+            'abs_shap': float(abs(shap_values[i]))
+        })
+
+    # Sort by absolute SHAP value
+    shap_contributions.sort(key=lambda x: x['abs_shap'], reverse=True)
+
+    # Build original row data dictionary
+    row_data_dict = row_data.iloc[0].to_dict()
+    # Convert numpy types to Python types for JSON serialization
+    for key, value in row_data_dict.items():
+        if isinstance(value, (np.integer, np.floating)):
+            row_data_dict[key] = value.item()
+
+    return {
+        'row_index': row_index,
+        'row_data': row_data_dict,
+        'actual_target': actual_target,
+        'predicted_prob': predicted_prob,
+        'predicted_class': int(predicted_prob >= 0.5),
+        'base_value': base_value,
+        'shap_contributions': shap_contributions,
+        'waterfall_plot': waterfall_plot_path,
+        'reliability': reliability,
+        'model_info': {
+            'model_name': metadata.get('model_name'),
+            'model_group': metadata.get('model_group'),
+            'run_timestamp': metadata.get('timestamp'),
+            'metrics': metadata.get('metrics', {})
+        },
+        'metadata': {
+            'n_trials': n_trials,
+            'bg_size': bg_size,
+            'timestamp': datetime.now().isoformat()
+        }
+    }

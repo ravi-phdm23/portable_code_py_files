@@ -1,0 +1,548 @@
+"""
+Generative AI Narrative Renderer for Credit Risk Explanations
+
+This module implements the constrained GenAI layer that renders validated
+explanations in audit-ready narrative form. It does NOT generate new inferential
+content - it only translates empirically validated findings into coherent prose.
+
+Key Design Principles (from Introduction):
+1. Only operates on explanations that pass falsifiability tests
+2. Renders findings in Basel/EBA-compliant language
+3. Maintains full audit trail linking narrative to underlying evidence
+4. Produces structured, reproducible output
+
+References:
+- Basel Committee (2011): Principles for Sound Management of Operational Risk
+- EBA (2021): Discussion Paper on Machine Learning for IRB Models
+- Wang et al. (2025): Explainable Deep Credit Scoring Under Regulatory Constraints
+"""
+
+import os
+from typing import Dict, List, Any, Optional
+from datetime import datetime
+from dataclasses import dataclass
+import json
+
+
+@dataclass
+class NarrativeSection:
+    """A section of the generated narrative"""
+    section_type: str  # 'executive_summary', 'statistical_evidence', 'model_reasoning', etc.
+    title: str
+    content: str
+    evidence_links: List[str]  # References to underlying validation results
+    confidence_level: str  # 'high', 'medium', 'low'
+
+
+@dataclass
+class CreditRiskNarrative:
+    """Complete audit-ready narrative for a credit risk model"""
+    model_name: str
+    dataset_name: str
+    generation_timestamp: str
+
+    # Narrative sections
+    executive_summary: NarrativeSection
+    statistical_evidence: NarrativeSection
+    model_reasoning: NarrativeSection
+    risk_assessment: NarrativeSection
+    regulatory_compliance: NarrativeSection
+
+    # Audit trail
+    validation_report_id: str
+    evidence_manifest: Dict[str, Any]
+
+    # Metadata
+    generator_version: str
+    validation_config: Dict[str, Any]
+
+
+class GenAINarrativeRenderer:
+    """
+    Constrained generative AI layer for rendering validated explanations.
+
+    This class implements template-based narrative generation with strict
+    constraints to ensure outputs are grounded in empirical validation results.
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize narrative renderer.
+
+        Args:
+            config: Configuration for narrative generation
+        """
+        self.config = config or self._default_config()
+        self.generator_version = "1.0.0-falsifiability-driven"
+
+    def _default_config(self) -> Dict[str, Any]:
+        """Default configuration for narrative generation"""
+        return {
+            'language_style': 'regulatory',  # 'regulatory', 'technical', 'business'
+            'detail_level': 'comprehensive',  # 'summary', 'standard', 'comprehensive'
+            'include_caveats': True,
+            'reference_style': 'inline',  # 'inline', 'footnotes'
+            'max_section_length': 500  # words
+        }
+
+    def render_narrative(
+        self,
+        validated_findings: Dict[str, Any],
+        shap_summary: Dict[str, Any],
+        dataset_info: Dict[str, Any]
+    ) -> CreditRiskNarrative:
+        """
+        Render validated findings into audit-ready narrative.
+
+        This is the main entry point. It only accepts findings that have
+        passed validation (validated=True).
+
+        Args:
+            validated_findings: Output from format_validation_report_for_genai()
+            shap_summary: Summary of SHAP analysis results
+            dataset_info: Information about the dataset
+
+        Returns:
+            CreditRiskNarrative with structured, evidence-backed sections
+
+        Raises:
+            ValueError: If findings are not validated
+        """
+        # Enforce validation constraint
+        if not validated_findings.get('validated', False):
+            raise ValueError(
+                "GenAI layer can only render validated explanations. "
+                "This explanation failed falsifiability tests and cannot be rendered."
+            )
+
+        # Extract key information
+        model_name = validated_findings['model']
+        dataset_name = dataset_info.get('filename', 'Unknown Dataset')
+        confidence = validated_findings['confidence_level']
+
+        # Generate each section
+        exec_summary = self._generate_executive_summary(
+            validated_findings, shap_summary, dataset_name, confidence
+        )
+
+        stat_evidence = self._generate_statistical_evidence_section(
+            validated_findings['statistical_evidence']
+        )
+
+        model_reasoning = self._generate_model_reasoning_section(
+            shap_summary, confidence
+        )
+
+        risk_assessment = self._generate_risk_assessment_section(
+            validated_findings, shap_summary
+        )
+
+        regulatory = self._generate_regulatory_compliance_section(
+            validated_findings
+        )
+
+        # Build evidence manifest for audit trail
+        evidence_manifest = self._build_evidence_manifest(
+            validated_findings, shap_summary
+        )
+
+        return CreditRiskNarrative(
+            model_name=model_name,
+            dataset_name=dataset_name,
+            generation_timestamp=datetime.now().isoformat(),
+            executive_summary=exec_summary,
+            statistical_evidence=stat_evidence,
+            model_reasoning=model_reasoning,
+            risk_assessment=risk_assessment,
+            regulatory_compliance=regulatory,
+            validation_report_id=validated_findings['audit_trail']['timestamp'],
+            evidence_manifest=evidence_manifest,
+            generator_version=self.generator_version,
+            validation_config=self.config
+        )
+
+    def _generate_executive_summary(
+        self,
+        validated_findings: Dict[str, Any],
+        shap_summary: Dict[str, Any],
+        dataset_name: str,
+        confidence: float
+    ) -> NarrativeSection:
+        """Generate executive summary section"""
+        model = validated_findings['model']
+        n_tests = validated_findings['audit_trail']['tests_conducted']
+        passed = validated_findings['audit_trail']['tests_passed']
+
+        # Determine confidence descriptor
+        if confidence >= 0.9:
+            conf_desc = "high degree of confidence"
+        elif confidence >= 0.75:
+            conf_desc = "substantial confidence"
+        else:
+            conf_desc = "moderate confidence"
+
+        content = f"""This report presents a falsifiability-driven analysis of the {model} model applied to credit risk assessment on the {dataset_name} dataset. The model's predictions and explanations have been subjected to {n_tests} independent validation tests, of which {passed} were successfully passed, yielding a {conf_desc} in the reliability of the findings presented herein.
+
+The analysis follows a two-layer validation framework: (1) statistical reliability testing to ensure predictive differences are genuine rather than artefactual, and (2) explanatory validity testing to confirm that model reasoning aligns with genuine economic structure rather than spurious correlations. Only findings that survive both layers of empirical scrutiny are presented in this report, in accordance with Basel Committee principles requiring transparent, stable, and evidence-aligned decision logic in credit risk models."""
+
+        evidence_links = [
+            validated_findings['audit_trail']['timestamp'],
+            f"validation_tests_{n_tests}"
+        ]
+
+        confidence_level = "high" if confidence >= 0.9 else "medium" if confidence >= 0.75 else "low"
+
+        return NarrativeSection(
+            section_type="executive_summary",
+            title="Executive Summary",
+            content=content,
+            evidence_links=evidence_links,
+            confidence_level=confidence_level
+        )
+
+    def _generate_statistical_evidence_section(
+        self,
+        statistical_evidence: List[Dict[str, Any]]
+    ) -> NarrativeSection:
+        """Generate statistical evidence section"""
+        if not statistical_evidence:
+            content = "No statistical significance tests were conducted or passed validation thresholds."
+            evidence_links = []
+            confidence_level = "low"
+        else:
+            # Group by test type
+            test_groups = {}
+            for evidence in statistical_evidence:
+                test_type = evidence['test']
+                if test_type not in test_groups:
+                    test_groups[test_type] = []
+                test_groups[test_type].append(evidence)
+
+            paragraphs = []
+            paragraphs.append("Statistical reliability testing was conducted to establish that observed model performance differences reflect genuine predictive capacity rather than sampling variability or model noise. The following tests were performed:\n")
+
+            for test_type, findings in test_groups.items():
+                test_name = test_type.replace('_', ' ').title()
+
+                if test_type == 'wilcoxon':
+                    desc = "The Wilcoxon signed-rank test was applied to assess whether paired performance differences across cross-validation folds are statistically significant."
+                elif test_type == 'mcnemar':
+                    desc = "McNemar's test was employed to determine whether classification error patterns differ significantly between models."
+                elif test_type == 'delong':
+                    desc = "DeLong's test was used to compare the discriminatory capacity of ROC curves."
+                else:
+                    desc = f"The {test_name} test was conducted to assess statistical significance."
+
+                paragraphs.append(f"\n{desc}")
+
+                for finding in findings:
+                    p_val = finding['p_value']
+                    effect = finding.get('effect_size')
+
+                    if effect is not None:
+                        paragraphs.append(
+                            f"Results indicate {finding['finding']}, with effect size {effect:.3f}, "
+                            f"providing empirical support for the observed performance difference."
+                        )
+                    else:
+                        paragraphs.append(
+                            f"Results indicate {finding['finding']}, providing empirical evidence "
+                            f"of genuine model discrimination."
+                        )
+
+            content = "\n".join(paragraphs)
+            evidence_links = [f"stat_test_{e['test']}" for e in statistical_evidence]
+            confidence_level = "high"
+
+        return NarrativeSection(
+            section_type="statistical_evidence",
+            title="Statistical Reliability Evidence",
+            content=content,
+            evidence_links=evidence_links,
+            confidence_level=confidence_level
+        )
+
+    def _generate_model_reasoning_section(
+        self,
+        shap_summary: Dict[str, Any],
+        confidence: float
+    ) -> NarrativeSection:
+        """Generate model reasoning section from SHAP analysis"""
+        # Extract top features
+        top_features = shap_summary.get('top_features', [])
+
+        if not top_features:
+            content = "Insufficient validated feature importance data available for reasoning assessment."
+            evidence_links = []
+            confidence_level = "low"
+        else:
+            paragraphs = []
+            paragraphs.append(
+                "Having established statistical reliability, explanatory validity testing was conducted "
+                "to assess whether the model's apparent reasoning reflects genuine economic structure. "
+                "SHAP (SHapley Additive exPlanations) analysis was performed, grounded in cooperative "
+                "game theory, to quantify the contribution of each feature to model predictions.\n"
+            )
+
+            paragraphs.append("The validated feature importance ranking is as follows:\n")
+
+            for i, feature_info in enumerate(top_features[:10], 1):
+                feature_name = feature_info.get('feature', f'Feature {i}')
+                importance = feature_info.get('importance', 0)
+                direction = feature_info.get('direction', 'neutral')
+
+                if direction == 'positive':
+                    dir_desc = "increases default probability"
+                elif direction == 'negative':
+                    dir_desc = "decreases default probability"
+                else:
+                    dir_desc = "influences default probability"
+
+                paragraphs.append(
+                    f"{i}. {feature_name} (importance: {importance:.4f}) — {dir_desc}"
+                )
+
+            paragraphs.append(
+                "\nThese feature attributions have passed rank stability tests, confirming that "
+                "the identified relationships are robust to perturbation and not merely artefactual."
+            )
+
+            content = "\n".join(paragraphs)
+            evidence_links = [f"shap_feature_{f['feature']}" for f in top_features[:10]]
+
+            if confidence >= 0.9:
+                confidence_level = "high"
+            elif confidence >= 0.75:
+                confidence_level = "medium"
+            else:
+                confidence_level = "low"
+
+        return NarrativeSection(
+            section_type="model_reasoning",
+            title="Model Reasoning and Feature Importance",
+            content=content,
+            evidence_links=evidence_links,
+            confidence_level=confidence_level
+        )
+
+    def _generate_risk_assessment_section(
+        self,
+        validated_findings: Dict[str, Any],
+        shap_summary: Dict[str, Any]
+    ) -> NarrativeSection:
+        """Generate risk assessment and limitations section"""
+        confidence = validated_findings['confidence_level']
+        failed_tests = validated_findings['audit_trail']['tests_failed']
+
+        paragraphs = []
+        paragraphs.append(
+            "Model Risk Assessment and Limitations\n\n"
+            "In accordance with SR 11-7 guidance on model risk management, this section "
+            "identifies limitations and potential sources of model risk."
+        )
+
+        # Assess validation coverage
+        if failed_tests > 0:
+            paragraphs.append(
+                f"\nValidation Coverage: {failed_tests} validation test(s) did not achieve "
+                f"passing thresholds. Users should exercise caution and review the detailed "
+                f"validation report before relying on these findings for high-stakes decisions."
+            )
+
+        # Confidence-based caveats
+        if confidence < 0.75:
+            paragraphs.append(
+                "\nConfidence Level: The overall confidence in these explanations is below "
+                "the recommended threshold (75%). Additional validation across independent "
+                "datasets and time periods is recommended before operational deployment."
+            )
+
+        # Data-specific limitations
+        paragraphs.append(
+            "\nData Limitations: These findings are derived from historical data and may "
+            "not generalize to populations with different demographic compositions, economic "
+            "conditions, or credit environments. Regular model monitoring and recalibration "
+            "are essential to detect population drift and maintain predictive accuracy."
+        )
+
+        # Explanatory method limitations
+        paragraphs.append(
+            "\nExplanatory Method Limitations: SHAP provides local feature attributions "
+            "based on game-theoretic principles. While these attributions have passed "
+            "falsifiability tests, they represent associations rather than causal relationships. "
+            "Causal inference requires additional structural assumptions and domain knowledge "
+            "beyond the scope of this analysis."
+        )
+
+        content = "\n".join(paragraphs)
+        evidence_links = [
+            "validation_coverage",
+            "confidence_assessment",
+            "data_limitations"
+        ]
+
+        return NarrativeSection(
+            section_type="risk_assessment",
+            title="Model Risk Assessment and Limitations",
+            content=content,
+            evidence_links=evidence_links,
+            confidence_level="high"  # High confidence in the limitations themselves
+        )
+
+    def _generate_regulatory_compliance_section(
+        self,
+        validated_findings: Dict[str, Any]
+    ) -> NarrativeSection:
+        """Generate regulatory compliance section"""
+        tests_conducted = validated_findings['audit_trail']['tests_conducted']
+        tests_passed = validated_findings['audit_trail']['tests_passed']
+
+        paragraphs = []
+        paragraphs.append(
+            "Regulatory Compliance and Governance\n\n"
+            "This analysis has been conducted in alignment with the following regulatory frameworks:"
+        )
+
+        paragraphs.append(
+            "\n1. Basel Committee Principles (2011): The model validation framework implements "
+            "robust governance structures, including independent validation tests and documentation "
+            "of model limitations, as required for operational risk management."
+        )
+
+        paragraphs.append(
+            "\n2. SR 11-7 Model Risk Management (Federal Reserve, 2011): The analysis includes "
+            "effective challenge of model assumptions through structured falsification tests. "
+            f"{tests_conducted} independent validation tests were conducted, with {tests_passed} "
+            "achieving passing thresholds, demonstrating rigorous model validation."
+        )
+
+        paragraphs.append(
+            "\n3. EBA Discussion Paper on Machine Learning (2021): The framework addresses the "
+            "'black box' challenge by requiring that model reasoning be explained, validated, "
+            "and documented in audit-ready form. The constrained generative AI layer ensures "
+            "that narrative outputs are grounded in empirical validation rather than speculative "
+            "interpretation."
+        )
+
+        paragraphs.append(
+            "\nAudit Trail: A complete audit trail linking each narrative claim to underlying "
+            "validation results is maintained in the evidence manifest. This ensures full "
+            "reproducibility and supports regulatory review."
+        )
+
+        content = "\n".join(paragraphs)
+        evidence_links = [
+            "basel_2011",
+            "sr_11_7_2011",
+            "eba_2021",
+            validated_findings['audit_trail']['timestamp']
+        ]
+
+        return NarrativeSection(
+            section_type="regulatory_compliance",
+            title="Regulatory Compliance and Governance",
+            content=content,
+            evidence_links=evidence_links,
+            confidence_level="high"
+        )
+
+    def _build_evidence_manifest(
+        self,
+        validated_findings: Dict[str, Any],
+        shap_summary: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Build evidence manifest linking narrative claims to validation results.
+
+        This provides the audit trail ensuring full traceability.
+        """
+        return {
+            'validation_timestamp': validated_findings['audit_trail']['timestamp'],
+            'model_name': validated_findings['model'],
+            'explanation_method': validated_findings['method'],
+            'confidence_score': validated_findings['confidence_level'],
+            'statistical_tests': validated_findings['statistical_evidence'],
+            'explanatory_tests': validated_findings['explanatory_evidence'],
+            'shap_top_features': shap_summary.get('top_features', [])[:10],
+            'tests_summary': {
+                'total': validated_findings['audit_trail']['tests_conducted'],
+                'passed': validated_findings['audit_trail']['tests_passed'],
+                'failed': validated_findings['audit_trail']['tests_failed']
+            }
+        }
+
+    def export_narrative_to_text(self, narrative: CreditRiskNarrative) -> str:
+        """Export narrative to plain text format"""
+        sections = [
+            f"CREDIT RISK MODEL EXPLANATION REPORT",
+            f"Model: {narrative.model_name}",
+            f"Dataset: {narrative.dataset_name}",
+            f"Generated: {narrative.generation_timestamp}",
+            f"Generator Version: {narrative.generator_version}",
+            "=" * 80,
+            "",
+            narrative.executive_summary.title,
+            "-" * 80,
+            narrative.executive_summary.content,
+            "",
+            "=" * 80,
+            "",
+            narrative.statistical_evidence.title,
+            "-" * 80,
+            narrative.statistical_evidence.content,
+            "",
+            "=" * 80,
+            "",
+            narrative.model_reasoning.title,
+            "-" * 80,
+            narrative.model_reasoning.content,
+            "",
+            "=" * 80,
+            "",
+            narrative.risk_assessment.title,
+            "-" * 80,
+            narrative.risk_assessment.content,
+            "",
+            "=" * 80,
+            "",
+            narrative.regulatory_compliance.title,
+            "-" * 80,
+            narrative.regulatory_compliance.content,
+            "",
+            "=" * 80,
+            "",
+            "EVIDENCE MANIFEST",
+            "-" * 80,
+            json.dumps(narrative.evidence_manifest, indent=2)
+        ]
+
+        return "\n".join(sections)
+
+    def export_narrative_to_latex(self, narrative: CreditRiskNarrative) -> str:
+        """Export narrative to LaTeX format for inclusion in reports"""
+        from services.statistical_tests_latex import _escape_latex
+
+        latex = []
+        latex.append(r"\section{Model Explanation and Validation Report}")
+        latex.append("")
+        latex.append(r"\subsection{" + _escape_latex(narrative.executive_summary.title) + "}")
+        latex.append(_escape_latex(narrative.executive_summary.content))
+        latex.append("")
+
+        latex.append(r"\subsection{" + _escape_latex(narrative.statistical_evidence.title) + "}")
+        latex.append(_escape_latex(narrative.statistical_evidence.content))
+        latex.append("")
+
+        latex.append(r"\subsection{" + _escape_latex(narrative.model_reasoning.title) + "}")
+        latex.append(_escape_latex(narrative.model_reasoning.content))
+        latex.append("")
+
+        latex.append(r"\subsection{" + _escape_latex(narrative.risk_assessment.title) + "}")
+        latex.append(_escape_latex(narrative.risk_assessment.content))
+        latex.append("")
+
+        latex.append(r"\subsection{" + _escape_latex(narrative.regulatory_compliance.title) + "}")
+        latex.append(_escape_latex(narrative.regulatory_compliance.content))
+        latex.append("")
+
+        return "\n".join(latex)

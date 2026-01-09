@@ -1,0 +1,345 @@
+"""
+LLM Service for AI-Generated Explanations.
+Provides natural language explanations for SHAP analyses using OpenAI GPT.
+"""
+
+import os
+from typing import Dict, Any, List, Optional
+import json
+from datetime import datetime
+
+
+def generate_local_shap_explanation(
+    row_data: Dict[str, Any],
+    shap_contributions: List[Dict[str, Any]],
+    predicted_prob: float,
+    actual_target: int,
+    model_info: Dict[str, Any],
+    reliability: Dict[str, Any]
+) -> Dict[str, str]:
+    """
+    Generate AI explanation for a single-row SHAP analysis.
+
+    Args:
+        row_data: Dictionary of feature values for this row
+        shap_contributions: List of SHAP contributions sorted by importance
+        predicted_prob: Model's predicted probability
+        actual_target: Actual target value
+        model_info: Information about the model
+        reliability: Reliability metrics
+
+    Returns:
+        Dictionary with:
+        - explanation: Natural language explanation
+        - key_factors: Summary of top contributing factors
+        - confidence_assessment: Assessment of explanation reliability
+        - error: Error message if generation fails
+    """
+    try:
+        print("\n=== LLM Service Debug ===")
+
+        # Check if OpenAI API key is available
+        api_key = os.environ.get('OPENAI_API_KEY')
+        print(f"API Key found: {bool(api_key)}")
+        if api_key:
+            print(f"API Key starts with: {api_key[:20]}...")
+
+        if not api_key:
+            error_msg = 'OpenAI API key not configured. Set OPENAI_API_KEY environment variable.'
+            print(f"ERROR: {error_msg}")
+            return {
+                'explanation': None,
+                'key_factors': None,
+                'confidence_assessment': None,
+                'error': error_msg
+            }
+
+        # Import OpenAI (only if API key exists)
+        try:
+            from openai import OpenAI
+            print("✓ OpenAI library imported successfully")
+        except ImportError as e:
+            error_msg = f'OpenAI library not installed. Run: pip install openai. Error: {e}'
+            print(f"ERROR: {error_msg}")
+            return {
+                'explanation': None,
+                'key_factors': None,
+                'confidence_assessment': None,
+                'error': error_msg
+            }
+
+        print("Creating OpenAI client...")
+        client = OpenAI(api_key=api_key)
+        print("✓ OpenAI client created")
+
+        # Build prompt
+        print("Building prompt...")
+        prompt = _build_explanation_prompt(
+            row_data=row_data,
+            shap_contributions=shap_contributions,
+            predicted_prob=predicted_prob,
+            actual_target=actual_target,
+            model_info=model_info,
+            reliability=reliability
+        )
+        print(f"✓ Prompt built ({len(prompt)} characters)")
+
+        # Call OpenAI API
+        print("Calling OpenAI API (gpt-4o-mini)...")
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Using cost-effective model
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert in credit risk modeling and machine learning explainability. "
+                               "Your role is to translate SHAP analysis results into clear, actionable explanations "
+                               "for business users and risk analysts. Be concise, precise, and focus on practical insights."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.3,  # Low temperature for consistency
+            max_tokens=800
+        )
+        print("✓ OpenAI API call successful")
+
+        explanation_text = response.choices[0].message.content.strip()
+        print(f"✓ Received explanation ({len(explanation_text)} characters)")
+
+        # Extract sections from the response
+        sections = _parse_explanation_sections(explanation_text)
+        print(f"✓ Parsed sections: {list(sections.keys())}")
+        print("=== LLM Service Debug End ===\n")
+
+        return {
+            'explanation': sections.get('explanation', explanation_text),
+            'key_factors': sections.get('key_factors'),
+            'confidence_assessment': sections.get('confidence_assessment'),
+            'error': None
+        }
+
+    except Exception as e:
+        error_msg = f'Failed to generate AI explanation: {str(e)}'
+        print(f"ERROR: {error_msg}")
+        print(f"Exception type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        print("=== LLM Service Debug End ===\n")
+        return {
+            'explanation': None,
+            'key_factors': None,
+            'confidence_assessment': None,
+            'error': error_msg
+        }
+
+
+def _build_explanation_prompt(
+    row_data: Dict[str, Any],
+    shap_contributions: List[Dict[str, Any]],
+    predicted_prob: float,
+    actual_target: int,
+    model_info: Dict[str, Any],
+    reliability: Dict[str, Any]
+) -> str:
+    """Build the prompt for OpenAI API."""
+
+    # Get top 5 contributors
+    top_contributions = shap_contributions[:5]
+
+    # Format contributions
+    contrib_text = []
+    for i, contrib in enumerate(top_contributions, 1):
+        feature = contrib['original_feature']
+        value = contrib['value']
+        shap_val = contrib['shap_value']
+        direction = "increases" if shap_val > 0 else "decreases"
+
+        # Format value based on type
+        if isinstance(value, (int, float)):
+            value_str = f"{value:.2f}" if isinstance(value, float) else str(value)
+        else:
+            value_str = str(value)
+
+        contrib_text.append(
+            f"{i}. {feature} = {value_str} (SHAP: {shap_val:+.4f}, {direction} risk by {abs(shap_val):.4f})"
+        )
+
+    contributions_formatted = "\n".join(contrib_text)
+
+    # Confidence score
+    confidence_score = reliability.get('confidence_score', 0.0)
+    confidence_level = "high" if confidence_score > 0.8 else "moderate" if confidence_score > 0.6 else "low"
+
+    # Model performance
+    test_auc = model_info.get('metrics', {}).get('test_auc', 'N/A')
+
+    prompt = f"""
+Analyze this credit risk prediction and provide a clear explanation.
+
+## Prediction Details
+- **Predicted Default Probability**: {predicted_prob:.1%}
+- **Predicted Class**: {"Default (1)" if predicted_prob >= 0.5 else "No Default (0)"}
+- **Actual Outcome**: {"Default (1)" if actual_target == 1 else "No Default (0)"}
+- **Prediction Accuracy**: {"Correct" if (predicted_prob >= 0.5) == (actual_target == 1) else "Incorrect"}
+
+## Model Information
+- **Model**: {model_info.get('model_name', 'Unknown')}
+- **Test AUC**: {test_auc if isinstance(test_auc, str) else f"{test_auc:.3f}"}
+
+## Top Contributing Factors (SHAP Analysis)
+{contributions_formatted}
+
+## Explanation Reliability
+- **Confidence Level**: {confidence_level} ({confidence_score:.2%})
+- **Ranking Stability**: {reliability.get('ranking_correlation', 0.0):.2%}
+
+## Task
+Provide a structured explanation with three sections:
+
+### 1. EXPLANATION
+Write 2-3 sentences explaining:
+- Why the model predicted this probability
+- Which factors most influenced the prediction
+- How these factors contributed to the risk assessment
+
+### 2. KEY_FACTORS
+List the 3 most important factors in a bulleted format, each with:
+- The factor name and value
+- How it impacted the prediction (increased/decreased risk)
+- The magnitude of its contribution
+
+### 3. CONFIDENCE_ASSESSMENT
+Write 1-2 sentences about:
+- The reliability of this explanation ({confidence_level} confidence with {confidence_score:.1%} score and {reliability.get('ranking_correlation', 0.0):.1%} ranking correlation)
+- What these reliability metrics mean for trusting this explanation
+- Any caveats or limitations to consider
+
+Format your response with clear section headers:
+**EXPLANATION:**
+[your explanation here]
+
+**KEY_FACTORS:**
+[bullet points here]
+
+**CONFIDENCE_ASSESSMENT:**
+[assessment here]
+"""
+
+    return prompt
+
+
+def _parse_explanation_sections(text: str) -> Dict[str, str]:
+    """Parse the structured response from OpenAI into sections."""
+    sections = {}
+
+    # Try to extract sections using markers
+    markers = {
+        'explanation': ['**EXPLANATION:**', 'EXPLANATION:', '## EXPLANATION', '### 1. EXPLANATION'],
+        'key_factors': ['**KEY_FACTORS:**', 'KEY_FACTORS:', '## KEY_FACTORS', '### 2. KEY_FACTORS'],
+        'confidence_assessment': ['**CONFIDENCE_ASSESSMENT:**', 'CONFIDENCE_ASSESSMENT:', '## CONFIDENCE_ASSESSMENT', '### 3. CONFIDENCE_ASSESSMENT']
+    }
+
+    for section_name, possible_markers in markers.items():
+        for marker in possible_markers:
+            if marker in text:
+                # Find the start of this section
+                start_idx = text.find(marker) + len(marker)
+
+                # Find the end (next section marker or end of text)
+                end_idx = len(text)
+                for next_section, next_markers in markers.items():
+                    if next_section != section_name:
+                        for next_marker in next_markers:
+                            next_idx = text.find(next_marker, start_idx)
+                            if next_idx != -1 and next_idx < end_idx:
+                                end_idx = next_idx
+
+                # Extract and clean the section
+                section_text = text[start_idx:end_idx].strip()
+                sections[section_name] = section_text
+                break
+
+    # If parsing failed, return the whole text as explanation
+    if not sections:
+        sections['explanation'] = text
+
+    return sections
+
+
+def generate_batch_explanations(
+    analyses: List[Dict[str, Any]],
+    max_concurrent: int = 3
+) -> List[Dict[str, str]]:
+    """
+    Generate AI explanations for multiple rows in batch.
+
+    Args:
+        analyses: List of analysis results from analyze_single_row()
+        max_concurrent: Maximum concurrent API calls (rate limiting)
+
+    Returns:
+        List of explanation dictionaries
+    """
+    import concurrent.futures
+    import time
+
+    explanations = []
+
+    def generate_single(analysis):
+        result = generate_local_shap_explanation(
+            row_data=analysis['row_data'],
+            shap_contributions=analysis['shap_contributions'],
+            predicted_prob=analysis['predicted_prob'],
+            actual_target=analysis['actual_target'],
+            model_info=analysis['model_info'],
+            reliability=analysis['reliability']
+        )
+        time.sleep(0.5)  # Rate limiting
+        return result
+
+    # Use thread pool for concurrent requests
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        explanations = list(executor.map(generate_single, analyses))
+
+    return explanations
+
+
+def test_llm_service() -> bool:
+    """
+    Test if LLM service is properly configured.
+
+    Returns:
+        True if OpenAI API is accessible, False otherwise
+    """
+    try:
+        print("\n=== Testing LLM Service ===")
+        api_key = os.environ.get('OPENAI_API_KEY')
+        print(f"API Key found: {bool(api_key)}")
+        if not api_key:
+            print("ERROR: No API key found")
+            return False
+
+        from openai import OpenAI
+        print("✓ OpenAI library imported")
+        client = OpenAI(api_key=api_key)
+        print("✓ OpenAI client created")
+
+        # Make a simple test call
+        print("Making test API call...")
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "Test"}],
+            max_tokens=5
+        )
+        print("✓ Test API call successful")
+        print("=== LLM Service Test: PASSED ===\n")
+        return True
+    except Exception as e:
+        print(f"ERROR: LLM Service test failed: {str(e)}")
+        print(f"Exception type: {type(e).__name__}")
+        import traceback
+        traceback.print_exc()
+        print("=== LLM Service Test: FAILED ===\n")
+        return False

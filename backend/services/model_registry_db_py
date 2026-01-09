@@ -1,0 +1,365 @@
+"""
+Model Registry Database Service
+Syncs the MODEL_REGISTRY to database for easy querying and documentation
+"""
+
+import sqlite3
+from typing import List, Dict, Any
+from config import get_database_url
+from services.model_registry import MODEL_REGISTRY
+
+
+def get_db_connection():
+    """Get database connection"""
+    db_path = get_database_url().replace('sqlite:///', '')
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def create_model_registry_table():
+    """
+    Create model_registry_catalog table to store model information.
+
+    Schema:
+    - id: Primary key
+    - model_group: Name of the model group
+    - model_variant: Specific model variant name
+    - model_class: Python class name (e.g., 'LogisticRegression')
+    - parameters: JSON string of model parameters
+    - calibration_method: Calibration method used
+    - calibration_cv: CV folds for calibration
+    - variant_number: Position within the group (for sorting)
+    - total_in_group: Total variants in this group
+    - is_optional: Whether this model requires optional dependencies
+    - created_at: When this entry was created
+    - updated_at: When this entry was last updated
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS model_registry_catalog (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            model_group TEXT NOT NULL,
+            model_variant TEXT NOT NULL,
+            model_class TEXT NOT NULL,
+            parameters TEXT,
+            calibration_method TEXT,
+            calibration_cv INTEGER,
+            variant_number INTEGER,
+            total_in_group INTEGER,
+            is_optional BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(model_group, model_variant)
+        )
+    """)
+
+    # Create index for faster queries
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_model_group
+        ON model_registry_catalog(model_group)
+    """)
+
+    conn.commit()
+    conn.close()
+
+    print("[OK] model_registry_catalog table created/verified")
+
+
+def sync_registry_to_database():
+    """
+    Sync the current MODEL_REGISTRY to the database.
+    This should be called on application startup or when models are updated.
+
+    Returns:
+        dict: Summary of sync operation
+    """
+    import json
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Ensure table exists
+    create_model_registry_table()
+
+    # Clear existing entries (we'll do a full sync)
+    cursor.execute("DELETE FROM model_registry_catalog")
+
+    # Track statistics
+    total_groups = 0
+    total_variants = 0
+    optional_groups = ['XGBoost', 'LightGBM']
+
+    # Sync each model group
+    for group_name, variants in MODEL_REGISTRY.items():
+        total_groups += 1
+        group_size = len(variants)
+        is_optional = group_name in optional_groups
+
+        for idx, (variant_name, config) in enumerate(variants.items(), 1):
+            total_variants += 1
+
+            # Extract model class name
+            model_class = config['model_class'].__name__
+
+            # Serialize parameters to JSON
+            params_json = json.dumps(config.get('params', {}), default=str)
+
+            # Extract calibration info
+            calibration = config.get('calibration', {})
+            calibration_method = calibration.get('method', '')
+            calibration_cv = calibration.get('cv', None)
+
+            # Insert into database
+            cursor.execute("""
+                INSERT INTO model_registry_catalog
+                (model_group, model_variant, model_class, parameters,
+                 calibration_method, calibration_cv, variant_number,
+                 total_in_group, is_optional)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                group_name,
+                variant_name,
+                model_class,
+                params_json,
+                calibration_method,
+                calibration_cv,
+                idx,
+                group_size,
+                is_optional
+            ))
+
+    conn.commit()
+    conn.close()
+
+    summary = {
+        'success': True,
+        'total_groups': total_groups,
+        'total_variants': total_variants,
+        'message': f'Synced {total_groups} model groups with {total_variants} variants to database'
+    }
+
+    print(f"[OK] {summary['message']}")
+    return summary
+
+
+def get_model_registry_summary() -> Dict[str, Any]:
+    """
+    Get summary statistics from the model registry catalog.
+
+    Returns:
+        dict: Summary with counts by group
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Get summary by group
+    cursor.execute("""
+        SELECT
+            model_group,
+            COUNT(*) as variant_count,
+            MAX(is_optional) as is_optional
+        FROM model_registry_catalog
+        GROUP BY model_group
+        ORDER BY model_group
+    """)
+
+    groups = []
+    for row in cursor.fetchall():
+        groups.append({
+            'group_name': row['model_group'],
+            'variant_count': row['variant_count'],
+            'is_optional': bool(row['is_optional'])
+        })
+
+    # Get total counts
+    cursor.execute("SELECT COUNT(DISTINCT model_group) as total_groups FROM model_registry_catalog")
+    total_groups = cursor.fetchone()['total_groups']
+
+    cursor.execute("SELECT COUNT(*) as total_variants FROM model_registry_catalog")
+    total_variants = cursor.fetchone()['total_variants']
+
+    conn.close()
+
+    return {
+        'total_groups': total_groups,
+        'total_variants': total_variants,
+        'groups': groups
+    }
+
+
+def get_models_by_group(group_name: str) -> List[Dict[str, Any]]:
+    """
+    Get all model variants for a specific group.
+
+    Args:
+        group_name: Name of the model group
+
+    Returns:
+        List of model variants with their details
+    """
+    import json
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            model_variant,
+            model_class,
+            parameters,
+            calibration_method,
+            calibration_cv,
+            variant_number,
+            total_in_group,
+            is_optional
+        FROM model_registry_catalog
+        WHERE model_group = ?
+        ORDER BY variant_number
+    """, (group_name,))
+
+    models = []
+    for row in cursor.fetchall():
+        models.append({
+            'variant_name': row['model_variant'],
+            'model_class': row['model_class'],
+            'parameters': json.loads(row['parameters']),
+            'calibration_method': row['calibration_method'],
+            'calibration_cv': row['calibration_cv'],
+            'variant_number': row['variant_number'],
+            'total_in_group': row['total_in_group'],
+            'is_optional': bool(row['is_optional'])
+        })
+
+    conn.close()
+    return models
+
+
+def get_all_model_groups() -> List[str]:
+    """
+    Get list of all model group names.
+
+    Returns:
+        List of model group names
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT DISTINCT model_group
+        FROM model_registry_catalog
+        ORDER BY model_group
+    """)
+
+    groups = [row['model_group'] for row in cursor.fetchall()]
+    conn.close()
+
+    return groups
+
+
+def get_registry_for_latex_table() -> Dict[str, Any]:
+    """
+    Get complete model registry data formatted for LaTeX table generation.
+    Returns ALL variants with their details for comprehensive documentation.
+
+    Returns:
+        dict with:
+        - groups: List of group dictionaries with full variant details
+        - total_groups: Total number of model families
+        - total_variants: Total number of model variants
+        - optional_count: Number of optional variants (XGBoost + LightGBM)
+    """
+    import json
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Get all groups ordered consistently
+    cursor.execute("""
+        SELECT DISTINCT model_group, is_optional
+        FROM model_registry_catalog
+        ORDER BY
+            CASE model_group
+                WHEN 'Logistic Regression' THEN 1
+                WHEN 'Regularized Logistic Regression' THEN 2
+                WHEN 'AdaBoost (Decision Tree Stumps)' THEN 3
+                WHEN 'Bagging (CART)' THEN 4
+                WHEN 'Bagging (MLP)' THEN 5
+                WHEN 'Random Forest' THEN 6
+                WHEN 'Gradient Boosting' THEN 7
+                WHEN 'K-Nearest Neighbors' THEN 8
+                WHEN 'XGBoost' THEN 9
+                WHEN 'LightGBM' THEN 10
+                ELSE 99
+            END
+    """)
+
+    groups_data = []
+    total_variants = 0
+    optional_count = 0
+
+    for group_row in cursor.fetchall():
+        group_name = group_row['model_group']
+        is_optional = bool(group_row['is_optional'])
+
+        # Get all variants for this group
+        cursor.execute("""
+            SELECT model_variant, calibration_method, calibration_cv
+            FROM model_registry_catalog
+            WHERE model_group = ?
+            ORDER BY variant_number
+        """, (group_name,))
+
+        variants = cursor.fetchall()
+        variant_names = [v['model_variant'] for v in variants]
+        variant_count = len(variant_names)
+
+        # Get calibration info (all should be the same)
+        cal_method = variants[0]['calibration_method'] if variants else 'sigmoid'
+        cal_cv = variants[0]['calibration_cv'] if variants else 3
+
+        groups_data.append({
+            'group_name': group_name,
+            'variants': variant_names,
+            'variant_count': variant_count,
+            'calibration_method': cal_method,
+            'calibration_cv': cal_cv,
+            'is_optional': is_optional
+        })
+
+        total_variants += variant_count
+        if is_optional:
+            optional_count += variant_count
+
+    conn.close()
+
+    return {
+        'groups': groups_data,
+        'total_groups': len(groups_data),
+        'total_variants': total_variants,
+        'optional_count': optional_count
+    }
+
+
+if __name__ == "__main__":
+    # When run directly, sync the registry to database
+    print("=" * 60)
+    print("MODEL REGISTRY DATABASE SYNC")
+    print("=" * 60)
+
+    result = sync_registry_to_database()
+    print(f"\n{result['message']}")
+
+    print("\n" + "=" * 60)
+    print("REGISTRY SUMMARY")
+    print("=" * 60)
+
+    summary = get_model_registry_summary()
+    print(f"\nTotal Groups: {summary['total_groups']}")
+    print(f"Total Variants: {summary['total_variants']}")
+    print("\nBreakdown by Group:")
+    for group in summary['groups']:
+        optional_flag = " (optional)" if group['is_optional'] else ""
+        print(f"  - {group['group_name']}: {group['variant_count']} variants{optional_flag}")

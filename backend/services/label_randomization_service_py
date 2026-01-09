@@ -1,0 +1,233 @@
+"""
+Label Randomization Service
+
+Implements label randomization testing for SHAP explanations as described in
+Adebayo et al. (2018) "Sanity Checks for Saliency Maps".
+
+The test verifies that explanations change meaningfully when labels are randomized,
+ensuring the explanation method is actually explaining the model and not just
+producing visually plausible but meaningless outputs.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+import shap
+
+
+def generate_randomized_shap_values(
+    df: pd.DataFrame,
+    selected_features: list,
+    target_column: str = 'target',
+    n_samples: int = 50,
+    random_state: int = 42
+):
+    """
+    Generate SHAP values for a model trained on randomized labels.
+
+    This implements the label randomization sanity check: train a model on
+    shuffled labels and compute SHAP values. If the original explanation
+    is meaningful, it should differ significantly from the randomized version.
+
+    Args:
+        df: DataFrame with features and target
+        selected_features: List of feature names to use
+        target_column: Name of target column
+        n_samples: Number of samples for SHAP background
+        random_state: Random seed for reproducibility
+
+    Returns:
+        dict with:
+        - randomized_shap_values: numpy array of SHAP values from randomized model
+        - feature_names: list of feature names
+        - base_value: expected value from randomized model
+        - random_accuracy: accuracy of randomized model (should be ~0.5 for binary)
+    """
+    # Prepare data
+    X = df[selected_features].copy()
+    y_original = df[target_column].copy()
+
+    # Encode target if categorical (e.g., 'ProfExe', 'NonProf')
+    if y_original.dtype == 'object' or y_original.dtype.name == 'category':
+        le_target = LabelEncoder()
+        y_original_encoded = le_target.fit_transform(y_original.astype(str))
+    else:
+        y_original_encoded = y_original.values
+
+    # Randomize labels
+    np.random.seed(random_state)
+    y_randomized = np.random.permutation(y_original_encoded)
+
+    # Split data
+    X_train, X_test, y_train_rand, y_test_rand = train_test_split(
+        X, y_randomized,
+        test_size=0.25,
+        random_state=random_state,
+        stratify=y_randomized
+    )
+
+    # Preprocess features: handle categorical and numeric features
+    # Identify numeric and categorical columns
+    numeric_cols = X_train.select_dtypes(include=['int64', 'float64']).columns.tolist()
+    categorical_cols = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+
+    # Create preprocessing pipelines
+    numeric_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median'))
+    ])
+
+    categorical_pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False, drop='first'))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_pipeline, numeric_cols),
+            ('cat', categorical_pipeline, categorical_cols)
+        ]
+    )
+
+    # Fit preprocessor and transform data
+    X_train_processed = preprocessor.fit_transform(X_train)
+    X_test_processed = preprocessor.transform(X_test)
+
+    # Train a simple model on randomized labels
+    # Use GradientBoosting as it's fast and commonly used
+    model = GradientBoostingClassifier(
+        n_estimators=50,
+        learning_rate=0.1,
+        max_depth=3,
+        random_state=random_state
+    )
+    model.fit(X_train_processed, y_train_rand)
+
+    # Check accuracy (should be around 0.5 for truly random labels)
+    random_accuracy = model.score(X_test_processed, y_test_rand)
+
+    # Create SHAP explainer with small background sample for speed
+    background_indices = np.random.choice(
+        X_train_processed.shape[0],
+        size=min(n_samples, X_train_processed.shape[0]),
+        replace=False
+    )
+    background_data = X_train_processed[background_indices]
+
+    # Use TreeExplainer for tree-based models (much faster than KernelExplainer)
+    explainer = shap.TreeExplainer(model, background_data)
+
+    # Compute SHAP values for a sample from test set
+    test_sample_indices = np.random.choice(
+        X_test_processed.shape[0],
+        size=min(10, X_test_processed.shape[0]),
+        replace=False
+    )
+    test_samples = X_test_processed[test_sample_indices]
+
+    shap_values = explainer.shap_values(test_samples)
+
+    # For binary classification, shap_values might be a list [class_0, class_1]
+    # We want class 1 (positive class)
+    if isinstance(shap_values, list):
+        shap_values = shap_values[1]
+
+    # Average SHAP values across test samples to get representative values
+    mean_shap_values = np.mean(shap_values, axis=0)
+
+    # Get base value (expected value)
+    base_value = explainer.expected_value
+    if isinstance(base_value, np.ndarray):
+        base_value = base_value[1]  # Class 1 for binary classification
+
+    # Get processed feature names (after one-hot encoding)
+    processed_feature_names = []
+    processed_feature_names.extend(numeric_cols)
+
+    if categorical_cols:
+        cat_transformer = preprocessor.named_transformers_['cat']
+        onehot_encoder = cat_transformer.named_steps['onehot']
+        cat_feature_names = onehot_encoder.get_feature_names_out(categorical_cols)
+        processed_feature_names.extend(cat_feature_names)
+
+    # Aggregate SHAP values back to original features
+    # For one-hot encoded features, sum their SHAP values to get the contribution of the original categorical feature
+    aggregated_shap_values = []
+
+    for orig_feature in selected_features:
+        if orig_feature in numeric_cols:
+            # For numeric features, use the SHAP value directly
+            idx = processed_feature_names.index(orig_feature)
+            aggregated_shap_values.append(mean_shap_values[idx])
+        else:
+            # For categorical features, sum SHAP values of all one-hot encoded columns
+            total_contribution = 0.0
+            for i, proc_name in enumerate(processed_feature_names):
+                # Check if this processed feature belongs to the original categorical feature
+                if proc_name.startswith(f"{orig_feature}_"):
+                    total_contribution += mean_shap_values[i]
+            aggregated_shap_values.append(total_contribution)
+
+    return {
+        'randomized_shap_values': np.array(aggregated_shap_values),
+        'feature_names': selected_features,
+        'base_value': float(base_value),
+        'random_accuracy': float(random_accuracy),
+        'n_test_samples': len(test_sample_indices),
+        'model_type': 'GradientBoostingClassifier'
+    }
+
+
+def compute_explanation_similarity(
+    original_shap: np.ndarray,
+    randomized_shap: np.ndarray
+) -> dict:
+    """
+    Compute similarity metrics between original and randomized explanations.
+
+    Args:
+        original_shap: SHAP values from original model
+        randomized_shap: SHAP values from randomized-label model
+
+    Returns:
+        dict with similarity metrics:
+        - pearson_correlation: Pearson correlation coefficient
+        - absolute_correlation: Absolute value of correlation
+        - cosine_similarity: Cosine similarity between vectors
+        - euclidean_distance: L2 distance between vectors
+    """
+    from scipy.stats import pearsonr
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    # Flatten arrays if needed
+    orig_flat = original_shap.flatten()
+    rand_flat = randomized_shap.flatten()
+
+    # Ensure same length
+    min_len = min(len(orig_flat), len(rand_flat))
+    orig_flat = orig_flat[:min_len]
+    rand_flat = rand_flat[:min_len]
+
+    # Pearson correlation
+    correlation, p_value = pearsonr(orig_flat, rand_flat)
+
+    # Cosine similarity
+    cos_sim = cosine_similarity(
+        orig_flat.reshape(1, -1),
+        rand_flat.reshape(1, -1)
+    )[0, 0]
+
+    # Euclidean distance
+    euclidean_dist = np.linalg.norm(orig_flat - rand_flat)
+
+    return {
+        'pearson_correlation': float(correlation),
+        'absolute_correlation': float(abs(correlation)),
+        'cosine_similarity': float(cos_sim),
+        'euclidean_distance': float(euclidean_dist),
+        'p_value': float(p_value)
+    }

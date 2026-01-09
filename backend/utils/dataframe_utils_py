@@ -1,0 +1,16 @@
+"""
+DataFrame utility functions.
+Stateless helpers for pandas operations.
+"""
+
+import pandas as pd
+import io
+
+
+def parse_csv_file(file_content):
+    """
+    Parse CSV file content into DataFrame.
+    file_content: bytes or string content
+    Returns DataFrame or raises exception.
+    """
+    return pd.read_csv(io.StringIO(file_content.decode('utf-8')))

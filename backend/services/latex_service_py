@@ -1,0 +1,956 @@
+"""
+LaTeX Report Generation Service.
+Generates reproducible LaTeX reports from model execution results.
+"""
+
+import os
+import subprocess
+import json
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+import pandas as pd
+
+from config import get_images_dir
+
+
+def _escape_latex(text: str) -> str:
+    """
+    Escape special LaTeX characters with comprehensive handling.
+
+    Handles all LaTeX special characters that could cause compilation errors.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    # Must escape backslash FIRST, before other replacements
+    text = text.replace('\\', r'\textbackslash{}')
+
+    # Then escape other special characters
+    replacements = {
+        '&': r'\&',
+        '%': r'\%',
+        '$': r'\$',
+        '#': r'\#',
+        '_': r'\_',
+        '{': r'\{',
+        '}': r'\}',
+        '~': r'\textasciitilde{}',
+        '^': r'\^{}',
+        '<': r'\textless{}',
+        '>': r'\textgreater{}',
+        '|': r'\textbar{}',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    return text
+
+
+def _format_metric(value: float, decimals: int = 4) -> str:
+    """Format metric value for LaTeX table."""
+    if value is None:
+        return 'N/A'
+    return f"{value:.{decimals}f}"
+
+
+def generate_evaluation_metrics_table() -> str:
+    """
+    Generate static evaluation metrics summary table.
+    This table describes all metrics used in the analysis.
+    """
+    latex = []
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Summary of evaluation metrics used for benchmarking and performance assessment.}")
+    latex.append(r"\label{tab:evaluation_metrics_full}")
+    latex.append(r"\setlength{\tabcolsep}{6pt}")
+    latex.append(r"\renewcommand{\arraystretch}{1.3}")
+    latex.append(r"\resizebox{\textwidth}{!}{%")
+    latex.append(r"\begin{tabular}{")
+    latex.append(r"  >{\raggedright\arraybackslash}p{4.0cm}")
+    latex.append(r"  >{\raggedright\arraybackslash}p{5.0cm}")
+    latex.append(r"  >{\centering\arraybackslash}p{5.5cm}")
+    latex.append(r"}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Metric (Full Form)} & \textbf{Usage} & \textbf{Formula} \\")
+    latex.append(r"\midrule")
+    latex.append("")
+    latex.append(r"AUC -- Area Under ROC Curve &")
+    latex.append(r"Ranking ability; sensitivity to score ordering &")
+    latex.append(r"$\displaystyle \mathrm{AUC} = \int_0^1 \mathrm{TPR}(x)\, d(\mathrm{FPR}(x))$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"PCC -- Prevalence Corrected Classification &")
+    latex.append(r"Accuracy adjusted for empirical class prevalence &")
+    latex.append(r"$\displaystyle \mathrm{PCC} =")
+    latex.append(r"\frac{\mathrm{TP} + \mathrm{TN}}")
+    latex.append(r"     {\mathrm{TP} + \mathrm{FP} + \mathrm{TN} + \mathrm{FN}}$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"F1 -- F1 Score &")
+    latex.append(r"Balances precision and recall; useful under class imbalance &")
+    latex.append(r"$\displaystyle F1 =")
+    latex.append(r"\frac{2 \times \mathrm{Precision} \times \mathrm{Recall}}")
+    latex.append(r"     {\mathrm{Precision} + \mathrm{Recall}}$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"Recall -- Sensitivity &")
+    latex.append(r"Ability to detect defaults (true positives) &")
+    latex.append(r"$\displaystyle \mathrm{Recall} =")
+    latex.append(r"\frac{\mathrm{TP}}{\mathrm{TP} + \mathrm{FN}}$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"BS -- Brier Score &")
+    latex.append(r"Measures probability calibration error &")
+    latex.append(r"$\displaystyle \mathrm{BS} =")
+    latex.append(r"\frac{1}{N} \sum_{i=1}^N (p_i - y_i)^2$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"KS -- Kolmogorov--Smirnov Statistic &")
+    latex.append(r"Maximum class separation between default and non-default distributions &")
+    latex.append(r"$\displaystyle \max_{t} \left|\mathrm{TPR}(t) - \mathrm{FPR}(t)\right|$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"PG -- Partial Gini &")
+    latex.append(r"Local discrimination in conservative decision regions &")
+    latex.append(r"$\displaystyle \mathrm{PG} = 2 \times \mathrm{AUC}_{(p \le b)} - 1$ \\")
+    latex.append(r"\midrule")
+    latex.append(r"H -- Hand's H-measure &")
+    latex.append(r"Utility-based, cost-sensitive alternative to AUC &")
+    latex.append(r"$\displaystyle H = 1 - \frac{\mathrm{EMC}}{\mathrm{EMC}_0}$ \\")
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"}")
+    latex.append(r"\end{table}")
+    latex.append("")
+    return "\n".join(latex)
+
+
+def generate_model_registry_table() -> str:
+    """
+    Generate LaTeX table showing complete model registry.
+    Lists ALL model variants used in the analysis with counts and metadata.
+
+    Returns:
+        LaTeX table code with complete model registry
+    """
+    from services.model_registry_db import get_registry_for_latex_table
+
+    try:
+        registry_data = get_registry_for_latex_table()
+    except Exception as e:
+        # If database query fails, return empty table with error message
+        return f"\\textit{{Model registry table unavailable: {_escape_latex(str(e))}}}\n"
+
+    groups = registry_data['groups']
+    total_groups = registry_data['total_groups']
+    total_variants = registry_data['total_variants']
+    optional_count = registry_data['optional_count']
+
+    latex = []
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    latex.append(r"\caption{Complete Classification Model Registry Used in Benchmark Analysis}")
+    latex.append(r"\label{tab:model_registry_complete}")
+    latex.append(r"\footnotesize")
+    latex.append(r"\setlength{\tabcolsep}{4pt}")
+    latex.append(r"\renewcommand{\arraystretch}{1.2}")
+    latex.append(r"\resizebox{\textwidth}{!}{%")
+    latex.append(r"\begin{tabular}{")
+    latex.append(r"  >{\raggedright\arraybackslash}p{3.5cm}")
+    latex.append(r"  >{\raggedright\arraybackslash}p{11cm}")
+    latex.append(r"  c")
+    latex.append(r"}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Model Group} & \textbf{All Variants} & \textbf{N} \\")
+    latex.append(r"\midrule")
+
+    # Add each model group
+    for group in groups:
+        group_name = group['group_name']
+        variants = group['variants']
+        variant_count = group['variant_count']
+
+        # Abbreviate group name for display
+        display_name = group_name
+        if group_name == "AdaBoost (Decision Tree Stumps)":
+            display_name = "AdaBoost (DT Stumps)"
+        elif group_name == "Regularized Logistic Regression":
+            display_name = "Regularized Logistic Reg."
+
+        # Format variants as comma-separated list
+        variants_str = ", ".join(variants)
+
+        # Build row
+        row = (
+            f"{_escape_latex(display_name)} & "
+            f"{_escape_latex(variants_str)} & "
+            f"{variant_count} \\\\"
+        )
+        latex.append(row)
+
+    # Add total row
+    latex.append(r"\midrule")
+    latex.append(f"\\textbf{{Total}} & \\textbf{{{total_groups} model families}} & \\textbf{{{total_variants}}} \\\\")
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"}") # end resizebox
+    latex.append(r"\\[6pt]")
+    latex.append(r"\begin{minipage}{\textwidth}")
+    latex.append(r"\footnotesize")
+
+    # Footnotes explaining abbreviations and conventions
+    latex.append(r"\textbf{Note:} All models use CalibratedClassifierCV with sigmoid method and 3-fold cross-validation. ")
+    latex.append(r"XGBoost and LightGBM models (8 variants) require optional library dependencies. \\")
+    latex.append(r"\textbf{Abbreviations:} DT = Decision Tree; Reg. = Regression. \\")
+    latex.append(r"\textbf{Variant naming convention:} Numbers indicate hyperparameters (e.g., RF-100 = 100 estimators). ")
+    latex.append(r"For GB: GB-N-LR (N = estimators, LR = learning rate). ")
+    latex.append(r"For KNN: KNN-N-D (N = neighbors, D = distance metric; U = uniform, D = distance-weighted). ")
+    latex.append(r"For XGB/LGBM: N = estimators, followed by learning rate.")
+
+    latex.append(r"\end{minipage}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    return "\n".join(latex)
+
+
+def generate_model_results_table(run_data: Dict[str, Any]) -> str:
+    """
+    Generate LaTeX table for model results.
+    
+    Args:
+        run_data: Dictionary containing:
+            - filename: Dataset name
+            - timestamp: Run timestamp
+            - all_models: List of model results
+            - best_models_by_group: Best per group
+            - benchmark_model: Overall best
+    
+    Returns:
+        LaTeX table code
+    """
+    models = run_data.get('all_models', [])
+
+    if not models:
+        return "\\textit{No model results available.}\\n"
+
+    filename = run_data.get('filename', 'unknown')
+    sanitized_name = str(filename).replace('.', '_').replace(' ', '_').replace('/', '_').replace('\\', '_')
+
+    latex = []
+    latex.append("\\begin{table}[H]")
+    latex.append("\\centering")
+    latex.append(f"\\caption{{Comprehensive Model Performance Results — {_escape_latex(filename)}}}")
+    latex.append(f"\\label{{tab:all_models_{sanitized_name}}}")
+    latex.append("\\footnotesize")
+    # Wrap table in adjustbox to ensure it fits page width
+    latex.append("\\begin{adjustbox}{max width=\\textwidth}")
+    latex.append("\\begin{tabular}{l l c c c c c c c}")
+    latex.append("\\toprule")
+    latex.append("Group & Model & AUC & PCC & Rec. & BS & KS & PG & H \\\\")
+    latex.append("\\midrule")
+
+    # Group models
+    grouped = {}
+    for model in models:
+        group = model.get('model_group', 'Unknown')
+        if group not in grouped:
+            grouped[group] = []
+        grouped[group].append(model)
+
+    # Helper to format and bold metrics for best model
+    def _m(key: str, metrics: Dict[str, Any], bold: bool) -> str:
+        val = _format_metric(metrics.get(key))
+        if bold and val != 'N/A':
+            return f"\\textbf{{{val}}}"
+        return val
+
+    # Write rows
+    for group_name, group_models in grouped.items():
+        for idx, model in enumerate(group_models):
+            metrics = model.get('metrics', {})
+            model_name = model.get('model_name', 'Unknown')
+
+            # Mark best in group
+            is_best = model.get('is_best_in_group', False)
+            name_display = f"\\textbf{{{_escape_latex(model_name)}}}" if is_best else _escape_latex(model_name)
+
+            if idx == 0:
+                group_display = _escape_latex(group_name)
+            else:
+                group_display = ""
+
+            row = (
+                f"{group_display} & {name_display} & "
+                f"{_m('AUC', metrics, is_best)} & "
+                f"{_m('PCC', metrics, is_best)} & "
+                f"{_m('Recall', metrics, is_best)} & "
+                f"{_m('BS', metrics, is_best)} & "
+                f"{_m('KS', metrics, is_best)} & "
+                f"{_m('PG', metrics, is_best)} & "
+                f"{_m('H', metrics, is_best)} \\\\\\\\"
+            )
+            latex.append(row)
+
+        latex.append("\\midrule")
+
+    latex.append("\\bottomrule")
+    latex.append("\\end{tabular}")
+    latex.append("\\end{adjustbox}")  # Close adjustbox
+    latex.append("\\end{table}")
+
+    return "\n".join(latex)
+
+
+def generate_benchmark_section(run_data: Dict[str, Any]) -> str:
+    """Generate LaTeX section for benchmark model."""
+    benchmark = run_data.get('benchmark_model')
+    
+    if not benchmark:
+        return ""
+    
+    latex = []
+    latex.append("\\subsection{Benchmark Model}")
+    latex.append(f"The best performing model overall was \\textbf{{{_escape_latex(benchmark.get('model_name', 'Unknown'))}}} ")
+    latex.append(f"from the {_escape_latex(benchmark.get('model_group', 'Unknown'))} group, ")
+    
+    metrics = benchmark.get('metrics', {})
+    latex.append(f"achieving an AUC of {_format_metric(metrics.get('AUC'))} ")
+    latex.append(f"and accuracy of {_format_metric(metrics.get('PCC'))}.")
+    
+    return "\n".join(latex)
+
+
+def generate_comprehensive_latex_report(
+    run_data: Dict[str, Any],
+    dataset_metadata: Dict[str, Any],
+    pandas_results: Dict[str, Any],
+    fi_results: Dict[str, Any],
+    shap_results: Dict[str, Any],
+    image_paths: Dict[str, str],
+    smote_results: Dict[str, Any] = None,
+    dataset_quality_summary: List[Dict[str, Any]] = None,
+    statistical_tests: List[Dict[str, Any]] = None,
+    label_randomization: Dict[str, Any] = None,
+    validated_commentaries: List[Dict[str, Any]] = None,
+    error: str = None,
+    **kwargs
+) -> str:
+    """
+    Generate publication-grade LaTeX report with comprehensive Results section.
+
+    Includes all database artifacts: dataset info, descriptive stats, class distributions,
+    all model metrics, feature importance tables, SHAP analysis, statistical tests,
+    label randomization sanity check, validated commentaries, and visualizations.
+
+    Args:
+        run_data: Model execution results
+        dataset_metadata: Dataset metadata from database
+        pandas_results: Pandas analysis results (describe, class distribution, etc.)
+        fi_results: Feature importance tables
+        shap_results: SHAP analysis results
+        image_paths: Paths to generated visualizations
+        smote_results: SMOTE analysis results (optional)
+        dataset_quality_summary: Dataset quality summary (Table X) (optional)
+        statistical_tests: Statistical significance test results (optional)
+        label_randomization: Label randomization test results (optional)
+        validated_commentaries: Validated commentaries with evidence layers (optional)
+
+    Returns:
+        Complete LaTeX document content
+    """
+    from services.results_section_generator import generate_results_section
+
+    latex = []
+
+    # Document header
+    latex.append("\\documentclass[12pt,a4paper]{article}")
+    latex.append("\\usepackage{booktabs}")
+    latex.append("\\usepackage{graphicx}")
+    latex.append("\\usepackage{float}")
+    latex.append("\\usepackage[margin=1in]{geometry}")
+    latex.append("\\usepackage{tabularx}")
+    latex.append("\\usepackage{lscape}")
+    latex.append("\\usepackage{adjustbox}")
+    latex.append("\\usepackage{array}")  # For advanced table column formatting
+    latex.append("\\usepackage{pgfplots}")  # For performance trend charts
+    latex.append("\\usepackage{pgfplotstable}")  # For pgfplots data tables
+    latex.append("\\pgfplotsset{compat=1.18}")  # Set pgfplots compatibility
+    latex.append("\\usepackage{amssymb}")  # For checkmark and cross symbols in statistical tests
+    latex.append("")
+    latex.append("\\title{Comprehensive Model Execution Report}")
+    latex.append("")
+    latex.append("\\begin{document}")
+    # latex.append("\\maketitle")
+    # latex.append("")
+
+    # # Experiment Metadata section
+    # latex.append("\\section{Experiment Metadata}")
+    # latex.append("\\begin{itemize}")
+    # latex.append(f"\\item \\textbf{{Dataset:}} {_escape_latex(run_data.get('filename', 'Unknown'))}")
+    # latex.append(f"\\item \\textbf{{SMOTE Applied:}} {'Yes' if run_data.get('use_smote', False) else 'No'}")
+
+    # features = run_data.get('selected_features', [])
+    # if features:
+    #     # Ensure features is a list
+    #     if not isinstance(features, list):
+    #         features = list(features) if hasattr(features, '__iter__') else []
+
+    #     if features:
+    #         latex.append(f"\\item \\textbf{{Features Selected:}} {len(features)}")
+    #         feature_list = [_escape_latex(str(f)) for f in features[:10]]
+    #         if feature_list:
+    #             latex.append(f"\\item \\textbf{{Feature List:}} {', '.join(feature_list)}")
+    #         if len(features) > 10:
+    #             latex.append(f"\\item ... and {len(features) - 10} more features")
+
+    # latex.append("\\end{itemize}")
+    # latex.append("")
+
+    # Add evaluation metrics table at the beginning
+    # REMOVED: Table added elsewhere in document
+    # latex.append(generate_evaluation_metrics_table())
+    # latex.append("")
+
+    # Add model registry table
+    latex.append(generate_model_registry_table())
+    latex.append("")
+
+    # Generate comprehensive Results section
+    results_section = generate_results_section(
+        run_data=run_data,
+        dataset_metadata=dataset_metadata,
+        pandas_results=pandas_results,
+        fi_results=fi_results,
+        shap_results=shap_results,
+        image_paths=image_paths,
+        smote_results=smote_results,
+        dataset_quality_summary=dataset_quality_summary,
+        statistical_tests=statistical_tests,
+        label_randomization=label_randomization,
+        validated_commentaries=validated_commentaries
+    )
+
+    if results_section:
+        latex.append(results_section)
+        latex.append("")
+
+    # Append image gallery based on run filename (filesystem match)
+    try:
+        filename = run_data.get('filename') if isinstance(run_data, dict) else None
+        if filename:
+            gallery = generate_image_gallery(filename)
+            if gallery:
+                latex.append(gallery)
+                latex.append("")
+    except Exception:
+        pass
+
+    latex.append("\\end{document}")
+
+    return "\n".join(latex)
+
+
+def generate_individual_latex_report(
+    run_data: Dict[str, Any],
+    include_metadata: bool = True
+) -> str:
+    """
+    Generate complete LaTeX report for a single run.
+
+    Args:
+        run_data: Model run data including filename, timestamp, results
+        include_metadata: Whether to include run metadata section
+
+    Returns:
+        Complete LaTeX document content
+    """
+    latex = []
+
+    # Document header with comprehensive packages for table handling
+    latex.append("\\documentclass{article}")
+    latex.append("\\usepackage{booktabs}")
+    latex.append("\\usepackage{graphicx}")
+    latex.append("\\usepackage{float}")
+    latex.append("\\usepackage[margin=1in]{geometry}")
+    latex.append("\\usepackage{tabularx}")  # For auto-wrapping columns
+    latex.append("\\usepackage{lscape}")    # For landscape orientation if needed
+    latex.append("\\usepackage{adjustbox}") # For table resizing
+    latex.append("\\usepackage{array}")  # For advanced table column formatting
+    latex.append("\\usepackage{pgfplots}")  # For performance trend charts
+    latex.append("\\usepackage{pgfplotstable}")  # For pgfplots data tables
+    latex.append("\\pgfplotsset{compat=1.18}")  # Set pgfplots compatibility
+    latex.append("")
+    # latex.append("\\title{Model Execution Results}")
+    # latex.append(f"\\author{{Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}}")
+    # latex.append("\\date{}")
+    # latex.append("")
+    # latex.append("\\begin{document}")
+    # latex.append("\\maketitle")
+    # latex.append("")
+
+    # # Metadata section
+    # if include_metadata:
+    #     latex.append("\\section{Experiment Metadata}")
+    #     latex.append("\\begin{itemize}")
+    #     latex.append(f"\\item \\textbf{{Dataset:}} {_escape_latex(run_data.get('filename', 'Unknown'))}")
+    #     latex.append(f"\\item \\textbf{{Execution Time:}} {run_data.get('timestamp', 'Unknown')}")
+    #     latex.append(f"\\item \\textbf{{SMOTE Applied:}} {'Yes' if run_data.get('use_smote', False) else 'No'}")
+
+    #     features = run_data.get('selected_features', [])
+    #     if features:
+    #         latex.append(f"\\item \\textbf{{Features Selected:}} {len(features)}")
+
+    #     latex.append("\\end{itemize}")
+    #     latex.append("")
+
+    # Add evaluation metrics table
+    # REMOVED: Table added elsewhere in document
+    # latex.append(generate_evaluation_metrics_table())
+    # latex.append("")
+
+    # Add model registry table
+    latex.append(generate_model_registry_table())
+    latex.append("")
+
+    # Results section
+    latex.append("\\section{Model Performance Results}")
+    latex.append(generate_model_results_table(run_data))
+    latex.append("")
+    
+    # # Benchmark section
+    # benchmark_section = generate_benchmark_section(run_data)
+    # if benchmark_section:
+    #     latex.append(benchmark_section)
+    #     latex.append("")
+    # Append image gallery for this run (if images exist)
+    try:
+        gallery = generate_image_gallery(run_data.get('filename', ''))
+        if gallery:
+            latex.append(gallery)
+            latex.append("")
+    except Exception:
+        pass
+
+    latex.append("\\end{document}")
+
+    return "\n".join(latex)
+
+
+def generate_combined_latex_report(
+    runs_data: List[Dict[str, Any]],
+    include_individual_metadata: bool = True
+) -> str:
+    """
+    Generate combined LaTeX report for multiple runs.
+
+    Args:
+        runs_data: List of model run data dictionaries
+        include_individual_metadata: Whether to include metadata per run
+
+    Returns:
+        Complete LaTeX document content
+    """
+    latex = []
+
+    # Document header with comprehensive packages for table handling
+    latex.append("\\documentclass{article}")
+    latex.append("\\usepackage{booktabs}")
+    latex.append("\\usepackage{graphicx}")
+    latex.append("\\usepackage{float}")
+    latex.append("\\usepackage[margin=1in]{geometry}")
+    latex.append("\\usepackage{tabularx}")  # For auto-wrapping columns
+    latex.append("\\usepackage{lscape}")    # For landscape orientation if needed
+    latex.append("\\usepackage{adjustbox}") # For table resizing
+    latex.append("\\usepackage{array}")  # For advanced table column formatting
+    latex.append("\\usepackage{pgfplots}")  # For performance trend charts
+    latex.append("\\usepackage{pgfplotstable}")  # For pgfplots data tables
+    latex.append("\\pgfplotsset{compat=1.18}")  # Set pgfplots compatibility
+    latex.append("")
+    latex.append("\\title{Combined Model Execution Results}")
+    latex.append(f"\\author{{Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}}")
+    latex.append("\\date{}")
+    latex.append("")
+    latex.append("\\begin{document}")
+    latex.append("\\maketitle")
+    latex.append("")
+
+    # Add evaluation metrics table
+    # REMOVED: Table added elsewhere in document
+    # latex.append(generate_evaluation_metrics_table())
+    # latex.append("")
+
+    # Add model registry table
+    latex.append(generate_model_registry_table())
+    latex.append("")
+
+    # Overview section
+    latex.append("\\section{Overview}")
+    latex.append(f"This report consolidates results from {len(runs_data)} experimental runs.")
+    latex.append("")
+    
+    # Individual run sections
+    for idx, run_data in enumerate(runs_data, 1):
+        latex.append(f"\\section{{Run {idx}: {_escape_latex(run_data.get('filename', 'Unknown'))}}}")
+        
+        if include_individual_metadata:
+            latex.append("\\subsection{Metadata}")
+            latex.append("\\begin{itemize}")
+            latex.append(f"\\item \\textbf{{Dataset:}} {_escape_latex(run_data.get('filename', 'Unknown'))}")
+            latex.append(f"\\item \\textbf{{Execution Time:}} {run_data.get('timestamp', 'Unknown')}")
+            latex.append(f"\\item \\textbf{{SMOTE Applied:}} {'Yes' if run_data.get('use_smote', False) else 'No'}")
+            latex.append("\\end{itemize}")
+            latex.append("")
+        
+        latex.append("\\subsection{Results}")
+        latex.append(generate_model_results_table(run_data))
+        latex.append("")
+        
+        benchmark_section = generate_benchmark_section(run_data)
+        if benchmark_section:
+            latex.append(benchmark_section)
+            latex.append("")
+    # Append image galleries for each run at the end of the combined report
+    for run_data in runs_data:
+        try:
+            gallery = generate_image_gallery(run_data.get('filename', ''))
+            if gallery:
+                latex.append(gallery)
+                latex.append("")
+        except Exception:
+            pass
+
+    latex.append("\\end{document}")
+
+    return "\n".join(latex)
+
+
+def generate_image_gallery(filename: str, max_width: str = "0.9\\textwidth") -> str:
+    """
+    Collect all images in `get_images_dir()` matching the given dataset filename and
+    generate LaTeX figure blocks to include them at the end of the report.
+
+    Matches both space-preserved and underscore variants (legacy).
+    """
+    base_name = filename.replace('.csv', '')
+    underscore_name = base_name.replace(' ', '_')
+
+    try:
+        files = os.listdir(get_images_dir())
+    except Exception:
+        return ""
+
+    matched = [f for f in sorted(files) if f.startswith(base_name) or f.startswith(underscore_name)]
+    if not matched:
+        return ""
+
+    latex = []
+    latex.append("\\section{Associated Images}")
+    latex.append("")
+
+    for img in matched:
+        full_img_path = os.path.abspath(os.path.join(get_images_dir(), img))
+        rel_path = full_img_path.replace("\\", "/")
+        caption = _escape_latex(img)
+        latex.append("\\begin{figure}[H]")
+        latex.append("\\centering")
+        latex.append(f"\\includegraphics[width={max_width}]{{{rel_path}}}")
+        latex.append(f"\\caption{{{caption}}}")
+        latex.append(f"\\label{{fig:{img.replace(' ', '_').replace('.', '_')}}}")
+        latex.append("\\end{figure}")
+        latex.append("")
+
+    return "\n".join(latex)
+
+
+def _validate_latex_syntax(latex_content: str) -> Dict[str, Any]:
+    """
+    Pre-validate LaTeX syntax before compilation.
+
+    Returns:
+        Dictionary with 'valid' boolean and 'issues' list
+    """
+    issues = []
+
+    # Check for common syntax errors
+    if latex_content.count(r'\begin{') != latex_content.count(r'\end{'):
+        issues.append("Mismatched \\begin{} and \\end{} tags")
+
+    # Check for required document structure
+    if r'\begin{document}' not in latex_content:
+        issues.append("Missing \\begin{document}")
+    if r'\end{document}' not in latex_content:
+        issues.append("Missing \\end{document}")
+    if r'\documentclass' not in latex_content:
+        issues.append("Missing \\documentclass declaration")
+
+    # Check for unescaped special characters (common errors)
+    # Look for standalone special chars not preceded by backslash
+    import re
+    unescaped_patterns = [
+        (r'(?<!\\)(?:\\\\)*[&%$#]', "Potentially unescaped special characters (&, %, $, #)"),
+        (r'(?<!\\textasciitilde)(?<!\\)~', "Potentially unescaped tilde (~)"),
+    ]
+
+    for pattern, message in unescaped_patterns:
+        if re.search(pattern, latex_content):
+            # This is a warning, not a hard error
+            pass  # Too many false positives
+
+    return {
+        'valid': len(issues) == 0,
+        'issues': issues
+    }
+
+
+def _check_latex_executable() -> Dict[str, Any]:
+    """
+    Check if pdflatex is available and get version info.
+
+    Returns:
+        Dictionary with 'available' boolean and 'version' string
+    """
+    try:
+        result = subprocess.run(
+            ['pdflatex', '--version'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False  # Explicit shell setting
+        )
+        # Check if command succeeded
+        if result.returncode == 0:
+            version_line = result.stdout.split('\n')[0] if result.stdout else "Unknown"
+            return {
+                'available': True,
+                'version': version_line
+            }
+        else:
+            return {
+                'available': False,
+                'version': None
+            }
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, Exception) as e:
+        # Broader exception handling for Windows compatibility
+        return {
+            'available': False,
+            'version': None,
+            'error': str(e)
+        }
+
+
+def compile_latex_to_pdf(latex_content: str, output_dir: str, output_name: str) -> Dict[str, str]:
+    """
+    Compile LaTeX content to PDF with comprehensive error logging.
+
+    Args:
+        latex_content: LaTeX source code
+        output_dir: Directory to save files
+        output_name: Base name for output files (without extension)
+
+    Returns:
+        Dictionary with paths and diagnostics:
+            - tex_path: Path to .tex file
+            - pdf_path: Path to .pdf file (if compilation succeeded)
+            - compiler_log_path: Path to full compiler output log
+            - success: Boolean indicating compilation success
+            - error_type: Category of error (missing_package, syntax_error, etc.)
+            - error_summary: Human-readable error description
+            - stdout: Full stdout from pdflatex
+            - stderr: Full stderr from pdflatex
+            - recoverable: Whether error might be fixable by user
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Write LaTeX file
+    tex_path = os.path.join(output_dir, f"{output_name}.tex")
+    with open(tex_path, 'w', encoding='utf-8') as f:
+        f.write(latex_content)
+
+    # Prepare paths for logs
+    compiler_log_path = os.path.join(output_dir, f"{output_name}_compiler.log")
+    latex_log_path = os.path.join(output_dir, f"{output_name}.log")
+
+    result = {
+        'tex_path': tex_path,
+        'pdf_path': None,
+        'compiler_log_path': compiler_log_path,
+        'success': False,
+        'error_type': None,
+        'error_summary': None,
+        'stdout': None,
+        'stderr': None,
+        'recoverable': False
+    }
+
+    # Pre-flight checks
+    # 1. Check if LaTeX is installed
+    latex_check = _check_latex_executable()
+    if not latex_check['available']:
+        result['error_type'] = 'missing_latex'
+        error_detail = latex_check.get('error', 'Unknown error')
+        result['error_summary'] = f"pdflatex executable not found. Install TeX Live or MiKTeX. Error: {error_detail}"
+        result['recoverable'] = False
+        with open(compiler_log_path, 'w', encoding='utf-8') as log_file:
+            log_file.write("ERROR: pdflatex not found in system PATH\n")
+            log_file.write(f"Error details: {error_detail}\n")
+            log_file.write("Install a LaTeX distribution (TeX Live, MiKTeX, etc.)\n")
+        return result
+
+    # 2. Validate LaTeX syntax
+    validation = _validate_latex_syntax(latex_content)
+    if not validation['valid']:
+        result['error_type'] = 'validation_error'
+        result['error_summary'] = "LaTeX syntax validation failed:\n" + "\n".join(validation['issues'])
+        result['recoverable'] = True
+        with open(compiler_log_path, 'w', encoding='utf-8') as log_file:
+            log_file.write("PRE-COMPILATION VALIDATION FAILED\n")
+            log_file.write("Issues found:\n")
+            for issue in validation['issues']:
+                log_file.write(f"  - {issue}\n")
+        return result
+
+    # Try to compile with pdflatex
+    try:
+        # Run pdflatex twice for proper references
+        stdout_combined = []
+        stderr_combined = []
+
+        for run_number in range(2):
+            process = subprocess.run(
+                ['pdflatex', '-interaction=nonstopmode', f'{output_name}.tex'],
+                cwd=output_dir,
+                capture_output=True,
+                text=True,
+                timeout=60  # Increased from 30s
+            )
+            stdout_combined.append(f"=== Run {run_number + 1} ===\n{process.stdout}")
+            stderr_combined.append(f"=== Run {run_number + 1} ===\n{process.stderr}")
+
+        # Persist full stdout and stderr to disk
+        result['stdout'] = '\n\n'.join(stdout_combined)
+        result['stderr'] = '\n\n'.join(stderr_combined)
+
+        with open(compiler_log_path, 'w', encoding='utf-8', errors='ignore') as log_file:
+            log_file.write("=" * 80 + "\n")
+            log_file.write("PDFLATEX COMPILER OUTPUT\n")
+            log_file.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            log_file.write(f"Command: pdflatex -interaction=nonstopmode {output_name}.tex\n")
+            log_file.write("=" * 80 + "\n\n")
+            log_file.write("STDOUT:\n")
+            log_file.write(result['stdout'])
+            log_file.write("\n\n" + "=" * 80 + "\n")
+            log_file.write("STDERR:\n")
+            log_file.write(result['stderr'])
+            log_file.write("\n\n" + "=" * 80 + "\n")
+
+        pdf_path = os.path.join(output_dir, f"{output_name}.pdf")
+
+        if os.path.exists(pdf_path):
+            result['pdf_path'] = pdf_path
+            result['success'] = True
+        else:
+            # Analyze failure and categorize error
+            error_analysis = _diagnose_latex_error(
+                latex_log_path,
+                result['stdout'],
+                result['stderr']
+            )
+            result['error_type'] = error_analysis['error_type']
+            result['error_summary'] = error_analysis['error_summary']
+            result['recoverable'] = error_analysis['recoverable']
+
+        # Clean up auxiliary files but KEEP logs
+        for ext in ['.aux', '.out']:
+            aux_file = os.path.join(output_dir, f"{output_name}{ext}")
+            if os.path.exists(aux_file):
+                try:
+                    os.remove(aux_file)
+                except:
+                    pass
+
+    except subprocess.TimeoutExpired:
+        result['error_type'] = 'timeout'
+        result['error_summary'] = "LaTeX compilation exceeded 60 second timeout"
+        result['recoverable'] = False
+        # Still save whatever output we have
+        with open(compiler_log_path, 'w', encoding='utf-8') as log_file:
+            log_file.write("COMPILATION TIMED OUT AFTER 60 SECONDS\n")
+    except FileNotFoundError:
+        result['error_type'] = 'missing_latex'
+        result['error_summary'] = "pdflatex executable not found. Install TeX Live or MiKTeX."
+        result['recoverable'] = False
+        with open(compiler_log_path, 'w', encoding='utf-8') as log_file:
+            log_file.write("ERROR: pdflatex not found in system PATH\n")
+    except Exception as e:
+        result['error_type'] = 'subprocess_error'
+        result['error_summary'] = f"Subprocess execution failed: {str(e)}"
+        result['recoverable'] = False
+        with open(compiler_log_path, 'w', encoding='utf-8') as log_file:
+            log_file.write(f"SUBPROCESS ERROR: {str(e)}\n")
+
+    return result
+
+
+def _diagnose_latex_error(latex_log_path: str, stdout: str, stderr: str) -> Dict[str, Any]:
+    """
+    Diagnose LaTeX compilation errors by analyzing logs.
+
+    Returns:
+        Dictionary with error_type, error_summary, and recoverable flag
+    """
+    error_type = 'unknown'
+    error_summary = "PDF file not generated - unknown error"
+    recoverable = False
+
+    # Read LaTeX log file if it exists
+    log_content = ""
+    if os.path.exists(latex_log_path):
+        with open(latex_log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            log_content = f.read()
+
+    # Combined text for analysis
+    all_text = f"{log_content}\n{stdout}\n{stderr}".lower()
+
+    # Check for missing packages
+    if 'file' in all_text and 'not found' in all_text:
+        # Extract package name
+        import re
+        package_match = re.search(r"! LaTeX Error: File `([^']+)' not found", log_content, re.IGNORECASE)
+        if package_match:
+            package_name = package_match.group(1)
+            error_type = 'missing_package'
+            error_summary = f"Missing LaTeX package or file: {package_name}"
+            recoverable = True
+
+    # Check for image/graphics errors
+    elif 'cannot determine size of graphic' in all_text or 'unknown graphics extension' in all_text:
+        error_type = 'graphics_error'
+        error_summary = "Graphics file error - invalid image path or unsupported format"
+        recoverable = True
+
+    # Check for syntax errors
+    elif '! undefined control sequence' in all_text:
+        error_type = 'syntax_error'
+        error_summary = "LaTeX syntax error - undefined command or control sequence"
+        recoverable = True
+
+    # Check for special character errors
+    elif 'missing $ inserted' in all_text or 'extra }' in all_text or 'missing }' in all_text:
+        error_type = 'escape_error'
+        error_summary = "Special character escaping error - unescaped LaTeX special characters"
+        recoverable = True
+
+    # Check for font errors
+    elif 'font' in all_text and ('not found' in all_text or 'unavailable' in all_text):
+        error_type = 'font_error'
+        error_summary = "Font not found or unavailable"
+        recoverable = True
+
+    # Extract actual error lines from log
+    if log_content:
+        error_lines = [line for line in log_content.split('\n') if line.startswith('!')]
+        if error_lines:
+            # Add first few error lines to summary
+            error_summary += f"\n\nFirst errors:\n" + '\n'.join(error_lines[:3])
+
+    return {
+        'error_type': error_type,
+        'error_summary': error_summary,
+        'recoverable': recoverable
+    }

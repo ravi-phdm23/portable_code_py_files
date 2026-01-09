@@ -1,0 +1,372 @@
+"""
+LaTeX generation for Statistical Significance Tests section.
+Generates publication-grade tables for Wilcoxon, McNemar, and DeLong tests.
+"""
+
+from typing import List, Dict, Any, Optional
+
+
+def _escape_latex(text: str) -> str:
+    """Escape special LaTeX characters."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.replace('\\', '\\textbackslash{}')
+    replacements = {
+        '&': '\\&',
+        '%': '\\%',
+        '$': '\\$',
+        '#': '\\#',
+        '_': '\\_',
+        '{': '\\{',
+        '}': '\\}',
+        '~': '\\textasciitilde{}',
+        '^': '\\^{}',
+        '<': '\\textless{}',
+        '>': '\\textgreater{}',
+        '|': '\\textbar{}',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _format_p_value(p_value: float) -> str:
+    """Format p-value for LaTeX display."""
+    if p_value < 0.001:
+        return r"$< 0.001$"
+    else:
+        return f"${p_value:.4f}$"
+
+
+def _get_significance_symbol(significant: bool) -> str:
+    """Return checkmark or cross for significance."""
+    if significant:
+        return r"$\checkmark$"  # Checkmark for significant
+    else:
+        return r"$\times$"  # Cross for not significant
+
+
+def generate_statistical_robustness_table(
+    statistical_tests: List[Dict[str, Any]],
+    dataset_filename: str = ""
+) -> str:
+    """
+    Generate Statistical Robustness of Performance-Optimal Models table.
+
+    This table compares reference models (best performers) against second-best candidates
+    using three statistical tests, providing an overall assessment.
+
+    Args:
+        statistical_tests: List of test results from get_statistical_test_results()
+        dataset_filename: Dataset filename for the table
+
+    Returns:
+        LaTeX code for the statistical robustness table
+    """
+    if not statistical_tests:
+        return ""
+
+    # Group tests by model pair
+    pair_results = {}
+    for test in statistical_tests:
+        model_pair = test.get('model_pair', '')
+        test_type = test.get('test', '')
+        result = test.get('result', {})
+
+        if model_pair not in pair_results:
+            pair_results[model_pair] = {
+                'wilcoxon': None,
+                'mcnemar': None,
+                'delong': None
+            }
+
+        if test_type in pair_results[model_pair]:
+            pair_results[model_pair][test_type] = result
+
+    if not pair_results:
+        return ""
+
+    latex = []
+
+    # Section header
+    latex.append(r"\subsection{Statistical Robustness of Candidate Models}")
+    latex.append("")
+    latex.append(r"Performance-optimal models (reference models) are compared against second-best candidates")
+    latex.append(r"using three statistical tests: Wilcoxon Signed-Rank Test, McNemar's Test, and")
+    latex.append(r"DeLong's Test. Each test evaluates whether performance differences are statistically significant")
+    latex.append(r"($p < 0.05$). Strong evidence (all 3 tests significant) confirms structural superiority.")
+    latex.append(r"When models are not significantly different, explanation reliability assessment determines")
+    latex.append(r"which model provides more trustworthy predictions for deployment.")
+    latex.append("")
+
+    # Table
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    caption = "Statistical Robustness of Performance-Optimal Models Across Datasets"
+    latex.append(f"\\caption{{{caption}}}")
+    latex.append(r"\label{tab:statistical_robustness}")
+    latex.append(r"\small")
+    latex.append(r"\begin{tabular}{lllcccc}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Dataset} & \textbf{Reference Model} & \textbf{Candidate Model} & \textbf{Wilcoxon} & \textbf{McNemar} & \textbf{DeLong} & \textbf{Overall Assessment} \\")
+    latex.append(r"\midrule")
+
+    # Process each pair
+    for model_pair, tests in pair_results.items():
+        # Parse model names
+        if ' vs ' in model_pair:
+            ref_model, cand_model = model_pair.split(' vs ', 1)
+        else:
+            ref_model, cand_model = model_pair, "Unknown"
+
+        ref_model_escaped = _escape_latex(ref_model)
+        cand_model_escaped = _escape_latex(cand_model)
+        dataset_escaped = _escape_latex(dataset_filename) if dataset_filename else "N/A"
+
+        # Get p-values for each test
+        wilcoxon_p = tests['wilcoxon'].get('p_value') if tests['wilcoxon'] else None
+        mcnemar_p = tests['mcnemar'].get('p_value') if tests['mcnemar'] else None
+        delong_p = tests['delong'].get('p_value') if tests['delong'] else None
+
+        # Format p-values or N/A
+        wilcoxon_str = f"{wilcoxon_p:.4f}" if wilcoxon_p is not None else "N/A"
+        mcnemar_str = f"{mcnemar_p:.4f}" if mcnemar_p is not None else "N/A"
+        delong_str = f"{delong_p:.4f}" if delong_p is not None else "N/A"
+
+        # Determine overall assessment
+        significant_count = 0
+        if wilcoxon_p is not None and wilcoxon_p < 0.05:
+            significant_count += 1
+        if mcnemar_p is not None and mcnemar_p < 0.05:
+            significant_count += 1
+        if delong_p is not None and delong_p < 0.05:
+            significant_count += 1
+
+        if significant_count == 3:
+            overall = "Strong Evidence"
+        elif significant_count == 2:
+            overall = "Moderate Evidence"
+        elif significant_count == 1:
+            overall = "Weak Evidence"
+        else:
+            overall = "Not Significantly Different"
+
+        latex.append(f"{dataset_escaped} & {ref_model_escaped} & {cand_model_escaped} & {wilcoxon_str} & {mcnemar_str} & {delong_str} & {overall} \\\\")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+    latex.append("")
+
+    # Add explanatory note
+    latex.append(r"\noindent\textit{Note: Statistical significance determined by $p$-value $< 0.05$ for each test}")
+    latex.append(r"\textit{(Wilcoxon Signed-Rank, McNemar's, and DeLong's tests). \textbf{Overall Assessment}: Strong Evidence}")
+    latex.append(r"\textit{= all 3 tests significant; Moderate Evidence = 2 tests significant; Weak Evidence = 1}")
+    latex.append(r"\textit{test significant; Not Significantly Different = no tests significant. When models are not}")
+    latex.append(r"\textit{significantly different, proceed to explanation reliability evaluation to determine which}")
+    latex.append(r"\textit{model provides more trustworthy predictions.}")
+    latex.append("")
+
+    return "\n".join(latex)
+
+
+def generate_statistical_tests_section(
+    statistical_tests: List[Dict[str, Any]],
+    filename: str = ""
+) -> str:
+    """
+    Generate LaTeX section for statistical significance tests.
+
+    Args:
+        statistical_tests: List of test results from get_statistical_test_results()
+        filename: Dataset filename for caption
+
+    Returns:
+        LaTeX code for statistical tests section
+    """
+    if not statistical_tests:
+        return ""
+
+    latex = []
+
+    # Section header
+    latex.append(r"\subsection{Statistical Significance Tests}")
+    latex.append("")
+    latex.append(r"Statistical significance tests were conducted to compare model performance.")
+    latex.append(r"The following tests assess whether observed performance differences are statistically meaningful:")
+    latex.append("")
+    latex.append(r"\begin{itemize}")
+    latex.append(r"  \item \textbf{Wilcoxon Signed-Rank Test}: Non-parametric test comparing paired AUC scores across cross-validation folds")
+    latex.append(r"  \item \textbf{McNemar's Test}: Tests for significant differences in classification errors between two models")
+    latex.append(r"  \item \textbf{DeLong's Test}: Compares ROC curves by testing equality of AUC values")
+    latex.append(r"\end{itemize}")
+    latex.append("")
+    latex.append(r"Significance level: $\alpha = 0.05$. A result is significant if $p < 0.05$.")
+    latex.append("")
+
+    # Group tests by type
+    wilcoxon_tests = [t for t in statistical_tests if t.get('test') == 'wilcoxon']
+    mcnemar_tests = [t for t in statistical_tests if t.get('test') == 'mcnemar']
+    delong_tests = [t for t in statistical_tests if t.get('test') == 'delong']
+
+    # Generate table for each test type
+    if wilcoxon_tests:
+        latex.append(_generate_wilcoxon_table(wilcoxon_tests, filename))
+        latex.append("")
+
+    if mcnemar_tests:
+        latex.append(_generate_mcnemar_table(mcnemar_tests, filename))
+        latex.append("")
+
+    if delong_tests:
+        latex.append(_generate_delong_table(delong_tests, filename))
+        latex.append("")
+
+    return "\n".join(latex)
+
+
+def _generate_wilcoxon_table(tests: List[Dict[str, Any]], filename: str) -> str:
+    """Generate LaTeX table for Wilcoxon signed-rank tests."""
+    latex = []
+
+    latex.append(r"\subsubsection{Wilcoxon Signed-Rank Test Results}")
+    latex.append("")
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    caption = f"Wilcoxon signed-rank test results comparing model performance"
+    if filename:
+        caption += f" on {_escape_latex(filename)}"
+    latex.append(f"\\caption{{{caption}. Tests compare AUC scores across cross-validation folds. Effect size (Cohen's d) quantifies the magnitude of difference.}}")
+    latex.append(r"\label{tab:wilcoxon_tests}")
+    latex.append(r"\small")
+    latex.append(r"\begin{tabular}{llcccc}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Model 1} & \textbf{Model 2} & \textbf{Statistic} & \textbf{p-value} & \textbf{Effect Size} & \textbf{Significant} \\")
+    latex.append(r"\midrule")
+
+    for test in tests:
+        model_pair = test.get('model_pair', '')
+        result = test.get('result', {})
+
+        # Parse model names from "Model1 vs Model2"
+        if ' vs ' in model_pair:
+            model1, model2 = model_pair.split(' vs ', 1)
+        else:
+            model1, model2 = model_pair, ""
+
+        model1_escaped = _escape_latex(model1)
+        model2_escaped = _escape_latex(model2)
+
+        statistic = result.get('statistic')
+        p_value = result.get('p_value')
+        effect_size = result.get('effect_size')
+        significant = result.get('significant', False)
+
+        stat_str = f"{statistic:.2f}" if statistic is not None else "N/A"
+        p_val_str = _format_p_value(p_value) if p_value is not None else "N/A"
+        effect_str = f"{effect_size:.3f}" if effect_size is not None else "N/A"
+        sig_str = _get_significance_symbol(significant)
+
+        latex.append(f"{model1_escaped} & {model2_escaped} & {stat_str} & {p_val_str} & {effect_str} & {sig_str} \\\\")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+
+    return "\n".join(latex)
+
+
+def _generate_mcnemar_table(tests: List[Dict[str, Any]], filename: str) -> str:
+    """Generate LaTeX table for McNemar's tests."""
+    latex = []
+
+    latex.append(r"\subsubsection{McNemar's Test Results}")
+    latex.append("")
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    caption = f"McNemar's test results comparing classification errors"
+    if filename:
+        caption += f" on {_escape_latex(filename)}"
+    latex.append(f"\\caption{{{caption}. Tests whether the two models make significantly different types of errors.}}")
+    latex.append(r"\label{tab:mcnemar_tests}")
+    latex.append(r"\small")
+    latex.append(r"\begin{tabular}{llccc}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Model 1} & \textbf{Model 2} & \textbf{Statistic} & \textbf{p-value} & \textbf{Significant} \\")
+    latex.append(r"\midrule")
+
+    for test in tests:
+        model_pair = test.get('model_pair', '')
+        result = test.get('result', {})
+
+        if ' vs ' in model_pair:
+            model1, model2 = model_pair.split(' vs ', 1)
+        else:
+            model1, model2 = model_pair, ""
+
+        model1_escaped = _escape_latex(model1)
+        model2_escaped = _escape_latex(model2)
+
+        statistic = result.get('statistic')
+        p_value = result.get('p_value')
+        significant = result.get('significant', False)
+
+        stat_str = f"{statistic:.2f}" if statistic is not None else "N/A"
+        p_val_str = _format_p_value(p_value) if p_value is not None else "N/A"
+        sig_str = _get_significance_symbol(significant)
+
+        latex.append(f"{model1_escaped} & {model2_escaped} & {stat_str} & {p_val_str} & {sig_str} \\\\")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+
+    return "\n".join(latex)
+
+
+def _generate_delong_table(tests: List[Dict[str, Any]], filename: str) -> str:
+    """Generate LaTeX table for DeLong's tests."""
+    latex = []
+
+    latex.append(r"\subsubsection{DeLong's Test Results}")
+    latex.append("")
+    latex.append(r"\begin{table}[H]")
+    latex.append(r"\centering")
+    caption = f"DeLong's test results comparing ROC curves"
+    if filename:
+        caption += f" on {_escape_latex(filename)}"
+    latex.append(f"\\caption{{{caption}. Tests whether the AUC values of two ROC curves are significantly different.}}")
+    latex.append(r"\label{tab:delong_tests}")
+    latex.append(r"\small")
+    latex.append(r"\begin{tabular}{llccc}")
+    latex.append(r"\toprule")
+    latex.append(r"\textbf{Model 1} & \textbf{Model 2} & \textbf{Statistic} & \textbf{p-value} & \textbf{Significant} \\")
+    latex.append(r"\midrule")
+
+    for test in tests:
+        model_pair = test.get('model_pair', '')
+        result = test.get('result', {})
+
+        if ' vs ' in model_pair:
+            model1, model2 = model_pair.split(' vs ', 1)
+        else:
+            model1, model2 = model_pair, ""
+
+        model1_escaped = _escape_latex(model1)
+        model2_escaped = _escape_latex(model2)
+
+        statistic = result.get('statistic')
+        p_value = result.get('p_value')
+        significant = result.get('significant', False)
+
+        stat_str = f"{statistic:.3f}" if statistic is not None else "N/A"
+        p_val_str = _format_p_value(p_value) if p_value is not None else "N/A"
+        sig_str = _get_significance_symbol(significant)
+
+        latex.append(f"{model1_escaped} & {model2_escaped} & {stat_str} & {p_val_str} & {sig_str} \\\\")
+
+    latex.append(r"\bottomrule")
+    latex.append(r"\end{tabular}")
+    latex.append(r"\end{table}")
+
+    return "\n".join(latex)
