@@ -1,0 +1,14 @@
+{
+  "version": "1.0",
+  "paths": {
+    "database_path": "sqlite:///C:/Python/Elucidate/Results/uploaded_data.db",
+    "images_dir": "C:/Python/Elucidate/Results/images",
+    "reports_dir": "C:/Python/Elucidate/Results/reports",
+    "logs_dir": "C:/Python/Elucidate/Results/logs",
+    "models_dir": "C:/Python/Elucidate/Results/models"
+  },
+  "metadata": {
+    "last_modified": "2025-12-24T12:53:10.305508",
+    "modified_by": "user"
+  }
+}
